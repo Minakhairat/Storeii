@@ -779,162 +779,210 @@
         }
 
         // ================================================================
-        // DATABASE CLASS (IndexedDB)
+        // LOCAL STORAGE ENGINE (fallback for IndexedDB)
+        // ================================================================
+        class LocalStorageEngine {
+            constructor() {
+                this.ready = true;
+                this.state = 'ready';
+                this._data = {};
+                // load existing data from localStorage
+                for (let key in localStorage) {
+                    if (key.startsWith('store_')) {
+                        const storeName = key.replace('store_', '');
+                        try {
+                            this._data[storeName] = JSON.parse(localStorage.getItem(key));
+                        } catch (e) {
+                            this._data[storeName] = [];
+                        }
+                    }
+                }
+                // ensure default stores exist
+                const defaultStores = ['users', 'settings', 'categories', 'inventoryItems', 'purchases', 'inventoryTransactions', 'products', 'recipeItems', 'orders', 'orderItems', 'auditLogs'];
+                defaultStores.forEach(name => {
+                    if (!this._data[name]) {
+                        this._data[name] = [];
+                        localStorage.setItem('store_' + name, JSON.stringify([]));
+                    }
+                });
+                // auto-increment counters
+                this._counters = {};
+                for (let name in this._data) {
+                    const items = this._data[name];
+                    if (items.length > 0) {
+                        const maxId = Math.max(...items.map(item => item.id || 0));
+                        this._counters[name] = maxId + 1;
+                    } else {
+                        this._counters[name] = 1;
+                    }
+                }
+            }
+
+            _saveStore(name) {
+                localStorage.setItem('store_' + name, JSON.stringify(this._data[name] || []));
+            }
+
+            async getAll(storeName) {
+                return this._data[storeName] || [];
+            }
+
+            async get(storeName, id) {
+                const items = this._data[storeName] || [];
+                return items.find(item => item.id === id) || null;
+            }
+
+            async add(storeName, record) {
+                const items = this._data[storeName] || [];
+                const newId = this._counters[storeName] || 1;
+                record.id = newId;
+                items.push(record);
+                this._data[storeName] = items;
+                this._counters[storeName] = newId + 1;
+                this._saveStore(storeName);
+                return newId;
+            }
+
+            async put(storeName, record) {
+                const items = this._data[storeName] || [];
+                const index = items.findIndex(item => item.id === record.id);
+                if (index !== -1) {
+                    items[index] = record;
+                } else {
+                    // if not found, add it (but we keep id from record)
+                    const newId = record.id || (this._counters[storeName] || 1);
+                    record.id = newId;
+                    items.push(record);
+                    if (!record.id) {
+                        this._counters[storeName] = newId + 1;
+                    }
+                }
+                this._data[storeName] = items;
+                this._saveStore(storeName);
+                return record.id;
+            }
+
+            async delete(storeName, id) {
+                const items = this._data[storeName] || [];
+                const filtered = items.filter(item => item.id !== id);
+                this._data[storeName] = filtered;
+                this._saveStore(storeName);
+            }
+
+            // compatibility with IndexedDB transaction-like methods (no-op)
+            async waitReady() { return true; }
+        }
+
+        // ================================================================
+        // DATABASE CLASS (tries IndexedDB, falls back to localStorage)
         // ================================================================
         class Database {
             constructor() {
-                this.db = null;
+                this.engine = null;
                 this.state = 'opening';
                 this.errorMsg = null;
                 this.readyPromise = this.init();
             }
 
             async init() {
-                return new Promise((resolve, reject) => {
-                    if (!window.indexedDB) {
-                        this.state = 'error';
-                        return reject("المتصفح لا يدعم قاعدة البيانات");
-                    }
-                    const request = window.indexedDB.open('StoreManagerDB_V1', 2);
-                    request.onupgradeneeded = (event) => {
-                        const db = event.target.result;
-                        const tx = event.target.transaction;
-                        this.createSchema(db, tx);
-                    };
-                    request.onsuccess = async (event) => {
-                        this.db = event.target.result;
-                        try {
-                            await this.ensureDefaultData();
-                            this.state = 'ready';
-                            const infoEl = document.getElementById('loginInfo');
-                            if (infoEl) infoEl.style.display = 'none';
-                            resolve(true);
-                        } catch (err) {
-                            reject(err);
-                        }
-                    };
-                    request.onerror = (e) => {
-                        reject(e.target.error.message);
-                    };
-                });
+                try {
+                    // try IndexedDB first
+                    const idb = new IndexedDBEngine();
+                    await idb.readyPromise;
+                    this.engine = idb;
+                    console.log('Using IndexedDB engine');
+                } catch (e) {
+                    console.warn('IndexedDB failed, falling back to localStorage', e);
+                    this.engine = new LocalStorageEngine();
+                    console.log('Using localStorage engine');
+                }
+                this.state = 'ready';
+                // ensure default data
+                await this.ensureDefaultData();
+                const infoEl = document.getElementById('loginInfo');
+                if (infoEl) infoEl.style.display = 'none';
+                return true;
             }
 
             async waitReady() {
                 if (this.state === 'ready') return true;
-                if (this.state === 'error') throw new Error(this.errorMsg);
                 await this.readyPromise;
                 return true;
             }
 
-            createSchema(db, tx) {
-                const stores = [
-                    { name: 'users', keyPath: 'id' },
-                    { name: 'settings', keyPath: 'id' },
-                    { name: 'categories', keyPath: 'id', autoIncrement: true },
-                    { name: 'inventoryItems', keyPath: 'id', autoIncrement: true },
-                    { name: 'purchases', keyPath: 'id', autoIncrement: true },
-                    { name: 'inventoryTransactions', keyPath: 'id', autoIncrement: true },
-                    { name: 'products', keyPath: 'id', autoIncrement: true },
-                    { name: 'recipeItems', keyPath: 'id', autoIncrement: true },
-                    { name: 'orders', keyPath: 'id', autoIncrement: true },
-                    { name: 'orderItems', keyPath: 'id', autoIncrement: true },
-                    { name: 'auditLogs', keyPath: 'id', autoIncrement: true }
-                ];
-                stores.forEach(s => {
-                    if (!db.objectStoreNames.contains(s.name)) {
-                        db.createObjectStore(s.name, { keyPath: s.keyPath, autoIncrement: s.autoIncrement || false });
-                    }
-                });
+            // ============================================================
+            // IndexedDB engine (inner class)
+            // ============================================================
+            async _indexedDBEngine() {
+                // this will be instantiated inside init
             }
 
-            // ============================================================
-            // FIX: ensureDefaultData - now properly awaits hash generation
-            // ============================================================
             async ensureDefaultData() {
-                await this.waitReady(); // ensure db is open
-                return new Promise(async (resolve, reject) => {
-                    const tx = this.db.transaction(['users', 'settings', 'categories'], 'readwrite');
-                    tx.oncomplete = () => resolve();
-                    tx.onerror = (e) => reject(e.target.error);
+                await this.waitReady();
+                // check if users exist
+                const users = await this.getAll('users');
+                if (users.length === 0) {
+                    const adminHash = await this.hashPassword('admin123');
+                    const cashierHash = await this.hashPassword('cashier123');
+                    await this.add('users', { id: 1, username: 'admin', password: adminHash, role: 'admin', name: 'المدير' });
+                    await this.add('users', { id: 2, username: 'cashier', password: cashierHash, role: 'cashier', name: 'الكاشير' });
+                }
 
-                    try {
-                        const usersStore = tx.objectStore('users');
-                        const adminHash = await this.hashPassword('admin123');
-                        const cashierHash = await this.hashPassword('cashier123');
+                // settings
+                const settings = await this.get('settings', 1);
+                if (!settings) {
+                    await this.add('settings', {
+                        id: 1,
+                        restaurantName: 'متجري',
+                        phone: '0123456789',
+                        address: 'القاهرة، مصر',
+                        taxEnabled: false,
+                        taxPercent: 14,
+                        footerMessage: 'شكرًا لزيارتكم',
+                        receiptWidth: 80,
+                        receiptHeader: 'متجري - شكرًا لكم',
+                        receiptFooter: 'نتمنى لكم يومًا سعيدًا',
+                        profitMargin: 40,
+                        logo: null
+                    });
+                }
 
-                        // Check if users already exist
-                        const adminReq = usersStore.get(1);
-                        adminReq.onsuccess = (e) => {
-                            if (!e.target.result) {
-                                usersStore.add({ id: 1, username: 'admin', password: adminHash, role: 'admin', name: 'المدير' });
-                            }
-                        };
-                        const cashierReq = usersStore.get(2);
-                        cashierReq.onsuccess = (e) => {
-                            if (!e.target.result) {
-                                usersStore.add({ id: 2, username: 'cashier', password: cashierHash, role: 'cashier', name: 'الكاشير' });
-                            }
-                        };
-
-                        // Settings
-                        const setReq = tx.objectStore('settings').get(1);
-                        setReq.onsuccess = (e) => {
-                            if (!e.target.result) {
-                                tx.objectStore('settings').add({
-                                    id: 1,
-                                    restaurantName: 'متجري',
-                                    phone: '0123456789',
-                                    address: 'القاهرة، مصر',
-                                    taxEnabled: false,
-                                    taxPercent: 14,
-                                    footerMessage: 'شكرًا لزيارتكم',
-                                    receiptWidth: 80,
-                                    receiptHeader: 'متجري - شكرًا لكم',
-                                    receiptFooter: 'نتمنى لكم يومًا سعيدًا',
-                                    profitMargin: 40,
-                                    logo: null
-                                });
-                            }
-                        };
-
-                        // Categories
-                        const catReq = tx.objectStore('categories').count();
-                        catReq.onsuccess = (e) => {
-                            if (e.target.result === 0) {
-                                const cats = ['ملابس', 'عطور', 'إكسسوارات', 'أحذية', 'حقائب', 'أخرى'];
-                                cats.forEach(name => tx.objectStore('categories').add({ name }));
-                            }
-                        };
-                    } catch (err) {
-                        reject(err);
+                // categories
+                const cats = await this.getAll('categories');
+                if (cats.length === 0) {
+                    const defaultCats = ['ملابس', 'عطور', 'إكسسوارات', 'أحذية', 'حقائب', 'أخرى'];
+                    for (let name of defaultCats) {
+                        await this.add('categories', { name });
                     }
-                });
+                }
             }
 
             async hashPassword(password) {
-                const encoder = new TextEncoder();
-                const data = encoder.encode(password);
-                const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-                const hashArray = Array.from(new Uint8Array(hashBuffer));
-                return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+                try {
+                    const encoder = new TextEncoder();
+                    const data = encoder.encode(password);
+                    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+                    const hashArray = Array.from(new Uint8Array(hashBuffer));
+                    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+                } catch (e) {
+                    // fallback simple hash (not secure but works)
+                    let hash = 0;
+                    for (let i = 0; i < password.length; i++) {
+                        const char = password.charCodeAt(i);
+                        hash = ((hash << 5) - hash) + char;
+                        hash = hash & hash;
+                    }
+                    return 'fallback_' + hash.toString(16);
+                }
             }
 
-            async execute(storeName, mode, operation, data) {
-                await this.waitReady();
-                return new Promise((resolve, reject) => {
-                    const tx = this.db.transaction(storeName, mode);
-                    const store = tx.objectStore(storeName);
-                    const request = data !== undefined ? store[operation](data) : store[operation]();
-                    request.onsuccess = (e) => resolve(e.target.result);
-                    request.onerror = (e) => reject(new Error(e.target.error.message));
-                });
-            }
-
-            async add(s, d) { return this.execute(s, 'readwrite', 'add', d); }
-            async put(s, d) { return this.execute(s, 'readwrite', 'put', d); }
-            async get(s, id) { return this.execute(s, 'readonly', 'get', id); }
-            async getAll(s) { return this.execute(s, 'readonly', 'getAll'); }
-            async delete(s, id) { return this.execute(s, 'readwrite', 'delete', id); }
+            // ============================================================
+            // Delegate methods to engine
+            // ============================================================
+            async add(store, data) { return this.engine.add(store, data); }
+            async put(store, data) { return this.engine.put(store, data); }
+            async get(store, id) { return this.engine.get(store, id); }
+            async getAll(store) { return this.engine.getAll(store); }
+            async delete(store, id) { return this.engine.delete(store, id); }
 
             // ============================================================
             // DEMO DATA & TOAST
@@ -1004,6 +1052,78 @@
         }
 
         // ================================================================
+        // IndexedDB Engine (real implementation)
+        // ================================================================
+        class IndexedDBEngine {
+            constructor() {
+                this.db = null;
+                this.state = 'opening';
+                this.readyPromise = this._init();
+            }
+
+            async _init() {
+                return new Promise((resolve, reject) => {
+                    if (!window.indexedDB) {
+                        reject('IndexedDB not supported');
+                        return;
+                    }
+                    const request = window.indexedDB.open('StoreManagerDB_V1', 2);
+                    request.onupgradeneeded = (event) => {
+                        const db = event.target.result;
+                        const tx = event.target.transaction;
+                        this._createSchema(db, tx);
+                    };
+                    request.onsuccess = (event) => {
+                        this.db = event.target.result;
+                        this.state = 'ready';
+                        resolve();
+                    };
+                    request.onerror = (e) => {
+                        reject(e.target.error.message);
+                    };
+                });
+            }
+
+            _createSchema(db, tx) {
+                const stores = [
+                    { name: 'users', keyPath: 'id' },
+                    { name: 'settings', keyPath: 'id' },
+                    { name: 'categories', keyPath: 'id', autoIncrement: true },
+                    { name: 'inventoryItems', keyPath: 'id', autoIncrement: true },
+                    { name: 'purchases', keyPath: 'id', autoIncrement: true },
+                    { name: 'inventoryTransactions', keyPath: 'id', autoIncrement: true },
+                    { name: 'products', keyPath: 'id', autoIncrement: true },
+                    { name: 'recipeItems', keyPath: 'id', autoIncrement: true },
+                    { name: 'orders', keyPath: 'id', autoIncrement: true },
+                    { name: 'orderItems', keyPath: 'id', autoIncrement: true },
+                    { name: 'auditLogs', keyPath: 'id', autoIncrement: true }
+                ];
+                stores.forEach(s => {
+                    if (!db.objectStoreNames.contains(s.name)) {
+                        db.createObjectStore(s.name, { keyPath: s.keyPath, autoIncrement: s.autoIncrement || false });
+                    }
+                });
+            }
+
+            async _execute(storeName, mode, operation, data) {
+                await this.readyPromise;
+                return new Promise((resolve, reject) => {
+                    const tx = this.db.transaction(storeName, mode);
+                    const store = tx.objectStore(storeName);
+                    const request = data !== undefined ? store[operation](data) : store[operation]();
+                    request.onsuccess = (e) => resolve(e.target.result);
+                    request.onerror = (e) => reject(new Error(e.target.error.message));
+                });
+            }
+
+            async add(store, data) { return this._execute(store, 'readwrite', 'add', data); }
+            async put(store, data) { return this._execute(store, 'readwrite', 'put', data); }
+            async get(store, id) { return this._execute(store, 'readonly', 'get', id); }
+            async getAll(store) { return this._execute(store, 'readonly', 'getAll'); }
+            async delete(store, id) { return this._execute(store, 'readwrite', 'delete', id); }
+        }
+
+        // ================================================================
         // INITIALIZATION & AUTH
         // ================================================================
         async function initApp() {
@@ -1019,9 +1139,13 @@
                 if (orders.length > 0) {
                     AppState.orderNumber = Math.max(...orders.map(o => parseInt(o.orderNumber.replace('ORD-', '')))) + 1;
                 }
+                // load settings
+                const set = await DBInstance.get('settings', 1);
+                if (set) AppState.settings = set;
             } catch (e) {
-                document.getElementById('loginError').textContent = 'فشل التهيئة.';
+                document.getElementById('loginError').textContent = 'فشل التهيئة: ' + e.message;
                 document.getElementById('loginError').style.display = 'block';
+                document.getElementById('loginInfo').style.display = 'none';
             }
         }
 
@@ -1282,7 +1406,7 @@
         async function backupDatabase() {
             try {
                 await DBInstance.waitReady();
-                const storeNames = Array.from(DBInstance.db.objectStoreNames);
+                const storeNames = ['users', 'settings', 'categories', 'inventoryItems', 'purchases', 'inventoryTransactions', 'products', 'recipeItems', 'orders', 'orderItems', 'auditLogs'];
                 const backupData = {};
                 for (let storeName of storeNames) {
                     backupData[storeName] = await DBInstance.getAll(storeName);
@@ -1310,28 +1434,19 @@
                     const backupData = JSON.parse(e.target.result);
                     await DBInstance.waitReady();
                     const storeNames = Object.keys(backupData);
-                    const validStores = storeNames.filter(name => DBInstance.db.objectStoreNames.contains(name));
-                    if (validStores.length === 0) {
-                        DBInstance.showToast('ملف النسخة الاحتياطية لا يحتوي على بيانات صالحة', 'error');
-                        return;
-                    }
-                    const tx = DBInstance.db.transaction(validStores, 'readwrite');
-                    tx.oncomplete = () => {
-                        DBInstance.showToast('تمت استعادة النسخة الاحتياطية بنجاح', 'success');
-                        setTimeout(() => window.location.reload(), 1500);
-                    };
-                    tx.onerror = (err) => {
-                        console.error(err);
-                        DBInstance.showToast('فشل استعادة البيانات عبر المعاملة', 'error');
-                    };
-                    for (let storeName of validStores) {
-                        const store = tx.objectStore(storeName);
-                        store.clear();
-                        const records = backupData[storeName];
-                        if (Array.isArray(records)) {
-                            records.forEach(record => store.put(record));
+                    for (let storeName of storeNames) {
+                        // clear existing data
+                        const existing = await DBInstance.getAll(storeName);
+                        for (let item of existing) {
+                            await DBInstance.delete(storeName, item.id);
+                        }
+                        // add new records
+                        for (let record of backupData[storeName]) {
+                            await DBInstance.add(storeName, record);
                         }
                     }
+                    DBInstance.showToast('تمت استعادة النسخة الاحتياطية بنجاح', 'success');
+                    setTimeout(() => window.location.reload(), 1500);
                 } catch (err) {
                     console.error(err);
                     DBInstance.showToast('ملف النسخة الاحتياطية غير صالح أو تالف', 'error');
@@ -2026,7 +2141,7 @@
         }
 
         // ================================================================
-        // DEMO DATA & CLEAR ALL (مع الإصلاحات)
+        // DEMO DATA & CLEAR ALL
         // ================================================================
         async function loadDemoData() {
             if (confirm('هل أنت متأكد من تحميل بيانات تجريبية (ملابس وعطور)؟')) {
@@ -2044,21 +2159,21 @@
         async function clearAllData() {
             if (!confirm('تحذير: سيتم حذف جميع الفواتير والمخزون نهائياً. تأكيد؟')) return;
             try {
-                const deleteRequest = indexedDB.deleteDatabase('StoreManagerDB_V1');
-                deleteRequest.onsuccess = () => {
-                    DBInstance.showToast('تم حذف جميع البيانات، سيتم إعادة تشغيل التطبيق.', 'info');
-                    setTimeout(() => window.location.reload(), 1000);
-                };
-                deleteRequest.onerror = (e) => {
-                    DBInstance.showToast('حدث خطأ أثناء حذف البيانات', 'error');
-                    console.error(e);
-                };
-                deleteRequest.onblocked = () => {
-                    DBInstance.showToast('لا يمكن حذف البيانات لأن المتصفح مشغول، حاول إغلاق النوافذ الأخرى.', 'warning');
-                };
+                // clear all stores
+                const storeNames = ['users', 'settings', 'categories', 'inventoryItems', 'purchases', 'inventoryTransactions', 'products', 'recipeItems', 'orders', 'orderItems', 'auditLogs'];
+                for (let name of storeNames) {
+                    const items = await DBInstance.getAll(name);
+                    for (let item of items) {
+                        await DBInstance.delete(name, item.id);
+                    }
+                }
+                // reinitialize default data
+                await DBInstance.ensureDefaultData();
+                DBInstance.showToast('تم مسح جميع البيانات وإعادة التهيئة', 'success');
+                setTimeout(() => window.location.reload(), 1000);
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('فشل حذف البيانات', 'error');
+                DBInstance.showToast('فشل مسح البيانات', 'error');
             }
         }
     </script>
