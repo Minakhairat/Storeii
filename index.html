@@ -739,6 +739,7 @@
         // ESCAPE HTML
         // ================================================================
         function escapeHtml(text) {
+            if (text === null || text === undefined) return '';
             const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
             return String(text).replace(/[&<>"']/g, m => map[m]);
         }
@@ -759,7 +760,8 @@
             settings: {},
             cartDiscount: 0,
             isLocked: false,
-            tempLogoBase64: null
+            tempLogoBase64: null,
+            isProcessingPayment: false
         };
 
         syncChannel.onmessage = async (event) => {
@@ -792,6 +794,7 @@
                         const storeName = key.replace('store_', '');
                         try {
                             this._data[storeName] = JSON.parse(localStorage.getItem(key));
+                            if (!Array.isArray(this._data[storeName])) this._data[storeName] = [];
                         } catch (e) {
                             this._data[storeName] = [];
                         }
@@ -809,8 +812,8 @@
                 this._counters = {};
                 for (let name in this._data) {
                     const items = this._data[name];
-                    if (items.length > 0) {
-                        const maxId = Math.max(...items.map(item => item.id || 0));
+                    if (items && items.length > 0) {
+                        const maxId = Math.max(...items.map(item => (item.id || 0)));
                         this._counters[name] = maxId + 1;
                     } else {
                         this._counters[name] = 1;
@@ -819,7 +822,8 @@
             }
 
             _saveStore(name) {
-                localStorage.setItem('store_' + name, JSON.stringify(this._data[name] || []));
+                const data = this._data[name] || [];
+                localStorage.setItem('store_' + name, JSON.stringify(data));
             }
 
             async getAll(storeName) {
@@ -846,13 +850,15 @@
                 const items = this._data[storeName] || [];
                 const index = items.findIndex(item => item.id === record.id);
                 if (index !== -1) {
+                    // update existing
                     items[index] = record;
                 } else {
-                    // if not found, add it (but we keep id from record)
+                    // not found: add with the given id (preserve id)
                     const newId = record.id || (this._counters[storeName] || 1);
                     record.id = newId;
                     items.push(record);
-                    if (!record.id) {
+                    // update counter if needed
+                    if (newId >= (this._counters[storeName] || 1)) {
                         this._counters[storeName] = newId + 1;
                     }
                 }
@@ -868,8 +874,32 @@
                 this._saveStore(storeName);
             }
 
-            // compatibility with IndexedDB transaction-like methods (no-op)
-            async waitReady() { return true; }
+            async waitReady() {
+                return true;
+            }
+
+            // Reset all data and counters
+            resetAll() {
+                this._data = {};
+                this._counters = {};
+                const defaultStores = ['users', 'settings', 'categories', 'inventoryItems', 'purchases', 'inventoryTransactions', 'products', 'recipeItems', 'orders', 'orderItems', 'auditLogs'];
+                defaultStores.forEach(name => {
+                    this._data[name] = [];
+                    this._counters[name] = 1;
+                    localStorage.setItem('store_' + name, JSON.stringify([]));
+                });
+                this._saveStore('users');
+                this._saveStore('settings');
+                this._saveStore('categories');
+                this._saveStore('inventoryItems');
+                this._saveStore('purchases');
+                this._saveStore('inventoryTransactions');
+                this._saveStore('products');
+                this._saveStore('recipeItems');
+                this._saveStore('orders');
+                this._saveStore('orderItems');
+                this._saveStore('auditLogs');
+            }
         }
 
         // ================================================================
@@ -885,7 +915,6 @@
 
             async init() {
                 try {
-                    // try IndexedDB first
                     const idb = new IndexedDBEngine();
                     await idb.readyPromise;
                     this.engine = idb;
@@ -896,7 +925,6 @@
                     console.log('Using localStorage engine');
                 }
                 this.state = 'ready';
-                // ensure default data
                 await this.ensureDefaultData();
                 const infoEl = document.getElementById('loginInfo');
                 if (infoEl) infoEl.style.display = 'none';
@@ -918,16 +946,16 @@
 
             async ensureDefaultData() {
                 await this.waitReady();
-                // check if users exist
+                // users
                 const users = await this.getAll('users');
-                if (users.length === 0) {
+                if (!users || users.length === 0) {
                     const adminHash = await this.hashPassword('admin123');
                     const cashierHash = await this.hashPassword('cashier123');
                     await this.add('users', { id: 1, username: 'admin', password: adminHash, role: 'admin', name: 'المدير' });
                     await this.add('users', { id: 2, username: 'cashier', password: cashierHash, role: 'cashier', name: 'الكاشير' });
                 }
 
-                // settings
+                // settings - always ensure settings with ID 1 exists
                 const settings = await this.get('settings', 1);
                 if (!settings) {
                     await this.add('settings', {
@@ -948,15 +976,30 @@
 
                 // categories
                 const cats = await this.getAll('categories');
-                if (cats.length === 0) {
+                if (!cats || cats.length === 0) {
                     const defaultCats = ['ملابس', 'عطور', 'إكسسوارات', 'أحذية', 'حقائب', 'أخرى'];
                     for (let name of defaultCats) {
                         await this.add('categories', { name });
                     }
                 }
+
+                // order number - compute from existing orders
+                const orders = await this.getAll('orders');
+                if (orders && orders.length > 0) {
+                    let maxOrderNum = 0;
+                    for (let o of orders) {
+                        const numStr = String(o.orderNumber || '').replace('ORD-', '');
+                        const num = parseInt(numStr, 10);
+                        if (!isNaN(num) && num > maxOrderNum) maxOrderNum = num;
+                    }
+                    if (maxOrderNum > 0) {
+                        AppState.orderNumber = maxOrderNum + 1;
+                    }
+                }
             }
 
             async hashPassword(password) {
+                if (!password) return '';
                 try {
                     const encoder = new TextEncoder();
                     const data = encoder.encode(password);
@@ -964,7 +1007,6 @@
                     const hashArray = Array.from(new Uint8Array(hashBuffer));
                     return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
                 } catch (e) {
-                    // fallback simple hash (not secure but works)
                     let hash = 0;
                     for (let i = 0; i < password.length; i++) {
                         const char = password.charCodeAt(i);
@@ -978,11 +1020,26 @@
             // ============================================================
             // Delegate methods to engine
             // ============================================================
-            async add(store, data) { return this.engine.add(store, data); }
-            async put(store, data) { return this.engine.put(store, data); }
-            async get(store, id) { return this.engine.get(store, id); }
-            async getAll(store) { return this.engine.getAll(store); }
-            async delete(store, id) { return this.engine.delete(store, id); }
+            async add(store, data) {
+                await this.waitReady();
+                return this.engine.add(store, data);
+            }
+            async put(store, data) {
+                await this.waitReady();
+                return this.engine.put(store, data);
+            }
+            async get(store, id) {
+                await this.waitReady();
+                return this.engine.get(store, id);
+            }
+            async getAll(store) {
+                await this.waitReady();
+                return this.engine.getAll(store);
+            }
+            async delete(store, id) {
+                await this.waitReady();
+                return this.engine.delete(store, id);
+            }
 
             // ============================================================
             // DEMO DATA & TOAST
@@ -990,8 +1047,10 @@
             async loadDemoData() {
                 try {
                     await this.waitReady();
-                    const items = await this.getAll('inventoryItems');
-                    if (items.length > 0) {
+
+                    // Check if data already exists
+                    const existingItems = await this.getAll('inventoryItems');
+                    if (existingItems && existingItems.length > 0) {
                         this.showToast('البيانات موجودة بالفعل، لا حاجة لتحميلها مرة أخرى.', 'info');
                         return;
                     }
@@ -1000,6 +1059,7 @@
                     const catMap = {};
                     categories.forEach(c => catMap[c.name] = c.id);
 
+                    // Create inventory items
                     const inventoryData = [
                         { name: 'تيشيرت بولو قطن', sku: 'TS-001', category: catMap['ملابس'] || 1, unit: 'قطعة', quantity: 50, minStock: 5, maxStock: 100, unitCost: 150, supplier: 'مصنع المنسوجات', notes: '' },
                         { name: 'بنطلون جينز كلاسيك', sku: 'JN-001', category: catMap['ملابس'] || 1, unit: 'قطعة', quantity: 30, minStock: 5, maxStock: 50, unitCost: 250, supplier: 'مصنع الجينز', notes: '' },
@@ -1008,13 +1068,13 @@
                         { name: 'بوكس هدايا فارغ', sku: 'BX-001', category: catMap['أخرى'] || 6, unit: 'قطعة', quantity: 100, minStock: 20, maxStock: 200, unitCost: 20, supplier: 'مصنع الكرتون', notes: '' }
                     ];
 
+                    const invIds = {};
                     for (const item of inventoryData) {
-                        await this.add('inventoryItems', item);
+                        const id = await this.add('inventoryItems', item);
+                        invIds[item.sku] = id;
                     }
-                    const addedInv = await this.getAll('inventoryItems');
-                    const invMap = {};
-                    addedInv.forEach(i => invMap[i.sku] = i.id);
 
+                    // Create products with recipes
                     const productsData = [
                         { name: 'تيشيرت بولو قطن', category: catMap['ملابس'] || 1, price: 300, status: 'active', recipe: [{ sku: 'TS-001', qty: 1 }] },
                         { name: 'بنطلون جينز كلاسيك', category: catMap['ملابس'] || 1, price: 450, status: 'active', recipe: [{ sku: 'JN-001', qty: 1 }] },
@@ -1026,13 +1086,17 @@
                     for (const p of productsData) {
                         const pid = await this.add('products', { name: p.name, category: p.category, price: p.price, status: p.status });
                         for (const r of p.recipe) {
-                            await this.add('recipeItems', { productId: pid, inventoryItemId: invMap[r.sku], quantity: r.qty });
+                            const invId = invIds[r.sku];
+                            if (invId) {
+                                await this.add('recipeItems', { productId: pid, inventoryItemId: invId, quantity: r.qty });
+                            }
                         }
                     }
+
                     this.showToast('تم تحميل بيانات المتجر التجريبية بنجاح', 'success');
                 } catch (e) {
                     console.error(e);
-                    this.showToast('خطأ في تحميل البيانات', 'error');
+                    this.showToast('خطأ في تحميل البيانات: ' + e.message, 'error');
                 }
             }
 
@@ -1067,7 +1131,7 @@
                         reject('IndexedDB not supported');
                         return;
                     }
-                    const request = window.indexedDB.open('StoreManagerDB_V1', 2);
+                    const request = window.indexedDB.open('StoreManagerDB_V2', 1);
                     request.onupgradeneeded = (event) => {
                         const db = event.target.result;
                         const tx = event.target.transaction;
@@ -1086,7 +1150,7 @@
 
             _createSchema(db, tx) {
                 const stores = [
-                    { name: 'users', keyPath: 'id' },
+                    { name: 'users', keyPath: 'id', autoIncrement: true },
                     { name: 'settings', keyPath: 'id' },
                     { name: 'categories', keyPath: 'id', autoIncrement: true },
                     { name: 'inventoryItems', keyPath: 'id', autoIncrement: true },
@@ -1121,6 +1185,11 @@
             async get(store, id) { return this._execute(store, 'readonly', 'get', id); }
             async getAll(store) { return this._execute(store, 'readonly', 'getAll'); }
             async delete(store, id) { return this._execute(store, 'readwrite', 'delete', id); }
+
+            async waitReady() {
+                await this.readyPromise;
+                return true;
+            }
         }
 
         // ================================================================
@@ -1135,16 +1204,24 @@
             });
             try {
                 await DBInstance.waitReady();
+                // load order number
                 const orders = await DBInstance.getAll('orders');
-                if (orders.length > 0) {
-                    AppState.orderNumber = Math.max(...orders.map(o => parseInt(o.orderNumber.replace('ORD-', '')))) + 1;
+                if (orders && orders.length > 0) {
+                    let maxNum = 0;
+                    for (let o of orders) {
+                        const numStr = String(o.orderNumber || '').replace('ORD-', '');
+                        const num = parseInt(numStr, 10);
+                        if (!isNaN(num) && num > maxNum) maxNum = num;
+                    }
+                    if (maxNum > 0) AppState.orderNumber = maxNum + 1;
                 }
                 // load settings
                 const set = await DBInstance.get('settings', 1);
                 if (set) AppState.settings = set;
             } catch (e) {
-                document.getElementById('loginError').textContent = 'فشل التهيئة: ' + e.message;
-                document.getElementById('loginError').style.display = 'block';
+                const errEl = document.getElementById('loginError');
+                errEl.textContent = 'فشل التهيئة: ' + e.message;
+                errEl.style.display = 'block';
                 document.getElementById('loginInfo').style.display = 'none';
             }
         }
@@ -1173,7 +1250,7 @@
                     AppState.currentRole = matchedUser.role;
                     document.getElementById('loginScreen').style.display = 'none';
                     document.getElementById('appContainer').style.display = 'block';
-                    document.getElementById('currentUserNameDisplay').textContent = matchedUser.name;
+                    document.getElementById('currentUserNameDisplay').textContent = matchedUser.name || matchedUser.username;
 
                     document.querySelectorAll('.sidebar .nav-item').forEach(item => {
                         const roles = item.getAttribute('data-role');
@@ -1183,7 +1260,7 @@
                     await loadSettings();
                     if (AppState.currentRole === 'cashier') await navigateTo('pos');
                     else await navigateTo('dashboard');
-                    DBInstance.showToast(`مرحبًا (${matchedUser.name})`, 'success');
+                    DBInstance.showToast('مرحبًا (' + (matchedUser.name || matchedUser.username) + ')', 'success');
                 } else {
                     err.textContent = 'كلمة المرور غير صحيحة';
                     err.style.display = 'block';
@@ -1240,18 +1317,38 @@
 
             try {
                 switch (page) {
-                    case 'dashboard': await renderDashboard(); break;
-                    case 'pos': await renderPOS(); break;
-                    case 'products': await renderProducts(); break;
-                    case 'itemcodes': await renderItemCodes(); break;
-                    case 'inventory': await renderInventory(); break;
-                    case 'purchases': await renderPurchases(); break;
-                    case 'orders': await renderOrders(); break;
-                    case 'reports': await generateReport('sales'); break;
-                    case 'settings': await loadSettings(); await renderCategories(); break;
+                    case 'dashboard':
+                        await renderDashboard();
+                        break;
+                    case 'pos':
+                        await renderPOS();
+                        break;
+                    case 'products':
+                        await renderProducts();
+                        break;
+                    case 'itemcodes':
+                        await renderItemCodes();
+                        break;
+                    case 'inventory':
+                        await renderInventory();
+                        break;
+                    case 'purchases':
+                        await renderPurchases();
+                        break;
+                    case 'orders':
+                        await renderOrders();
+                        break;
+                    case 'reports':
+                        await generateReport('sales');
+                        break;
+                    case 'settings':
+                        await loadSettings();
+                        await renderCategories();
+                        break;
                 }
             } catch (e) {
                 console.error(e);
+                DBInstance.showToast('خطأ في تحميل الصفحة: ' + e.message, 'error');
             }
         }
 
@@ -1282,81 +1379,153 @@
         }
 
         async function loadSettings() {
-            const set = await DBInstance.get('settings', 1);
-            if (set) {
-                AppState.settings = set;
-                document.getElementById('setRestaurantName').value = set.restaurantName || 'متجري';
-                document.getElementById('setPhone').value = set.phone || '';
-                document.getElementById('setAddress').value = set.address || '';
-                document.getElementById('setTaxEnabled').value = set.taxEnabled ? '1' : '0';
-                document.getElementById('setTaxPercent').value = set.taxPercent || 14;
-                document.getElementById('setFooterMessage').value = set.footerMessage || 'شكرًا لزيارتكم';
+            try {
+                await DBInstance.waitReady();
+                const set = await DBInstance.get('settings', 1);
+                if (set) {
+                    AppState.settings = set;
+                    document.getElementById('setRestaurantName').value = set.restaurantName || 'متجري';
+                    document.getElementById('setPhone').value = set.phone || '';
+                    document.getElementById('setAddress').value = set.address || '';
+                    document.getElementById('setTaxEnabled').value = set.taxEnabled ? '1' : '0';
+                    document.getElementById('setTaxPercent').value = set.taxPercent || 14;
+                    document.getElementById('setFooterMessage').value = set.footerMessage || 'شكرًا لزيارتكم';
+                    document.getElementById('setProfitMargin').value = set.profitMargin || 40;
+                    document.getElementById('setReceiptWidth').value = set.receiptWidth || 80;
+                    document.getElementById('setReceiptHeader').value = set.receiptHeader || 'متجري - شكرًا لكم';
+                    document.getElementById('setReceiptFooter').value = set.receiptFooter || 'نتمنى لكم يومًا سعيدًا';
 
-                const bH2 = document.querySelector('.sidebar .brand h2');
-                if (set.logo) {
-                    bH2.innerHTML = `<img src="${set.logo}" alt="Logo"><br>Store`;
-                } else {
-                    bH2.innerHTML = '🛍️ Store Manager';
+                    const bH2 = document.querySelector('.sidebar .brand h2');
+                    if (set.logo) {
+                        bH2.innerHTML = '<img src="' + escapeHtml(set.logo) + '" alt="Logo"><br>Store';
+                    } else {
+                        bH2.innerHTML = '🛍️ Store Manager';
+                    }
+                    if (set.logo) {
+                        document.getElementById('setLogoPreview').src = set.logo;
+                        document.getElementById('setLogoPreview').style.display = 'block';
+                    }
                 }
-                if (set.logo) {
-                    document.getElementById('setLogoPreview').src = set.logo;
-                    document.getElementById('setLogoPreview').style.display = 'block';
-                }
+            } catch (e) {
+                console.error('Error loading settings:', e);
             }
         }
 
         async function saveSettings(e) {
             e.preventDefault();
-            const set = {
-                ...AppState.settings,
-                restaurantName: document.getElementById('setRestaurantName').value,
-                phone: document.getElementById('setPhone').value,
-                address: document.getElementById('setAddress').value,
-                taxEnabled: document.getElementById('setTaxEnabled').value === '1',
-                taxPercent: parseFloat(document.getElementById('setTaxPercent').value) || 0,
-                footerMessage: document.getElementById('setFooterMessage').value,
-                logo: AppState.tempLogoBase64 || AppState.settings.logo
-            };
-            await DBInstance.put('settings', set);
-            AppState.settings = set;
-            await loadSettings();
-            DBInstance.showToast('تم الحفظ', 'success');
+            try {
+                await DBInstance.waitReady();
+                const set = {
+                    ...AppState.settings,
+                    restaurantName: document.getElementById('setRestaurantName').value,
+                    phone: document.getElementById('setPhone').value,
+                    address: document.getElementById('setAddress').value,
+                    taxEnabled: document.getElementById('setTaxEnabled').value === '1',
+                    taxPercent: parseFloat(document.getElementById('setTaxPercent').value) || 0,
+                    footerMessage: document.getElementById('setFooterMessage').value,
+                    profitMargin: parseFloat(document.getElementById('setProfitMargin').value) || 40,
+                    logo: AppState.tempLogoBase64 || AppState.settings.logo || null
+                };
+                set.id = 1;
+                await DBInstance.put('settings', set);
+                AppState.settings = set;
+                await loadSettings();
+                DBInstance.showToast('تم حفظ الإعدادات', 'success');
+            } catch (e) {
+                console.error(e);
+                DBInstance.showToast('خطأ في حفظ الإعدادات: ' + e.message, 'error');
+            }
         }
 
         async function changePassword(e) {
             e.preventDefault();
-            const cur = document.getElementById('currentPassword').value;
-            const neu = document.getElementById('newPassword').value;
-            const conf = document.getElementById('confirmPassword').value;
-            if (neu !== conf) {
+            const currentPassword = document.getElementById('currentPassword').value;
+            const newPassword = document.getElementById('newPassword').value;
+            const confirmPassword = document.getElementById('confirmPassword').value;
+
+            if (!currentPassword || !newPassword || !confirmPassword) {
+                DBInstance.showToast('جميع الحقول مطلوبة', 'warning');
+                return;
+            }
+            if (newPassword.length < 4) {
+                DBInstance.showToast('كلمة المرور الجديدة يجب أن تكون 4 أحرف على الأقل', 'warning');
+                return;
+            }
+            if (newPassword !== confirmPassword) {
                 DBInstance.showToast('كلمتا المرور غير متطابقتين', 'error');
                 return;
             }
-            DBInstance.showToast('تم تغيير كلمة المرور بنجاح', 'success');
-            e.target.reset();
+
+            try {
+                await DBInstance.waitReady();
+                const users = await DBInstance.getAll('users');
+                const currentUser = users.find(u => u.username === AppState.currentUser);
+                if (!currentUser) {
+                    DBInstance.showToast('المستخدم غير موجود', 'error');
+                    return;
+                }
+
+                const hashedCurrent = await DBInstance.hashPassword(currentPassword);
+                if (currentUser.password !== hashedCurrent) {
+                    DBInstance.showToast('كلمة المرور الحالية غير صحيحة', 'error');
+                    return;
+                }
+
+                const hashedNew = await DBInstance.hashPassword(newPassword);
+                currentUser.password = hashedNew;
+                await DBInstance.put('users', currentUser);
+
+                document.getElementById('currentPassword').value = '';
+                document.getElementById('newPassword').value = '';
+                document.getElementById('confirmPassword').value = '';
+                DBInstance.showToast('تم تغيير كلمة المرور بنجاح', 'success');
+            } catch (e) {
+                console.error(e);
+                DBInstance.showToast('خطأ في تغيير كلمة المرور: ' + e.message, 'error');
+            }
         }
 
         async function saveReceiptSettings(e) {
             e.preventDefault();
-            DBInstance.showToast('تم حفظ إعدادات الإيصال', 'success');
+            try {
+                await DBInstance.waitReady();
+                const set = {
+                    ...AppState.settings,
+                    receiptWidth: parseInt(document.getElementById('setReceiptWidth').value) || 80,
+                    receiptHeader: document.getElementById('setReceiptHeader').value,
+                    receiptFooter: document.getElementById('setReceiptFooter').value
+                };
+                set.id = 1;
+                await DBInstance.put('settings', set);
+                AppState.settings = set;
+                DBInstance.showToast('تم حفظ إعدادات الإيصال', 'success');
+            } catch (e) {
+                console.error(e);
+                DBInstance.showToast('خطأ في حفظ إعدادات الإيصال: ' + e.message, 'error');
+            }
         }
 
         // ================================================================
         // CATEGORIES MANAGEMENT
         // ================================================================
         async function renderCategories() {
-            const container = document.getElementById('categoriesList');
-            const cats = await DBInstance.getAll('categories');
-            if (cats.length === 0) {
-                container.innerHTML = '<p style="color:#999;text-align:center;">لا توجد تصنيفات حالياً</p>';
-                return;
+            try {
+                await DBInstance.waitReady();
+                const container = document.getElementById('categoriesList');
+                const cats = await DBInstance.getAll('categories');
+                if (!cats || cats.length === 0) {
+                    container.innerHTML = '<p style="color:#999;text-align:center;">لا توجد تصنيفات حالياً</p>';
+                    return;
+                }
+                container.innerHTML = cats.map(c =>
+                    '<div class="category-list-item">' +
+                    '<span class="cat-name">' + escapeHtml(c.name) + '</span>' +
+                    '<button class="btn btn-danger btn-sm" onclick="deleteCategory(' + c.id + ')">حذف</button>' +
+                    '</div>'
+                ).join('');
+            } catch (e) {
+                console.error(e);
             }
-            container.innerHTML = cats.map(c =>
-                `<div class="category-list-item">
-                    <span class="cat-name">${escapeHtml(c.name)}</span>
-                    <button class="btn btn-danger btn-sm" onclick="deleteCategory(${c.id})">حذف</button>
-                </div>`
-            ).join('');
         }
 
         async function addCategory() {
@@ -1366,38 +1535,50 @@
                 DBInstance.showToast('أدخل اسم التصنيف', 'warning');
                 return;
             }
-            const cats = await DBInstance.getAll('categories');
-            if (cats.some(c => c.name.toLowerCase() === name.toLowerCase())) {
-                DBInstance.showToast('هذا التصنيف موجود بالفعل', 'warning');
-                return;
+            try {
+                await DBInstance.waitReady();
+                const cats = await DBInstance.getAll('categories');
+                if (cats && cats.some(c => c.name.toLowerCase() === name.toLowerCase())) {
+                    DBInstance.showToast('هذا التصنيف موجود بالفعل', 'warning');
+                    return;
+                }
+                await DBInstance.add('categories', { name });
+                input.value = '';
+                DBInstance.showToast('تمت إضافة التصنيف', 'success');
+                await renderCategories();
+                if (document.getElementById('page-products').classList.contains('active')) await renderProducts();
+                if (document.getElementById('page-itemcodes').classList.contains('active')) await renderItemCodes();
+                if (document.getElementById('page-inventory').classList.contains('active')) await renderInventory();
+                if (document.getElementById('page-pos').classList.contains('active')) await renderPOS();
+            } catch (e) {
+                console.error(e);
+                DBInstance.showToast('خطأ في إضافة التصنيف: ' + e.message, 'error');
             }
-            await DBInstance.add('categories', { name });
-            input.value = '';
-            DBInstance.showToast('تمت إضافة التصنيف', 'success');
-            await renderCategories();
-            if (document.getElementById('page-products').classList.contains('active')) await renderProducts();
-            if (document.getElementById('page-itemcodes').classList.contains('active')) await renderItemCodes();
-            if (document.getElementById('page-inventory').classList.contains('active')) await renderInventory();
-            if (document.getElementById('page-pos').classList.contains('active')) await renderPOS();
         }
 
         async function deleteCategory(id) {
             if (!confirm('هل أنت متأكد من حذف هذا التصنيف؟')) return;
-            const products = await DBInstance.getAll('products');
-            const items = await DBInstance.getAll('inventoryItems');
-            const usedInProducts = products.some(p => p.category === id);
-            const usedInItems = items.some(i => i.category === id);
-            if (usedInProducts || usedInItems) {
-                DBInstance.showToast('لا يمكن حذف التصنيف لأنه مستخدم في منتجات أو أصناف.', 'error');
-                return;
+            try {
+                await DBInstance.waitReady();
+                const products = await DBInstance.getAll('products');
+                const items = await DBInstance.getAll('inventoryItems');
+                const usedInProducts = products && products.some(p => p.category === id);
+                const usedInItems = items && items.some(i => i.category === id);
+                if (usedInProducts || usedInItems) {
+                    DBInstance.showToast('لا يمكن حذف التصنيف لأنه مستخدم في منتجات أو أصناف.', 'error');
+                    return;
+                }
+                await DBInstance.delete('categories', id);
+                DBInstance.showToast('تم حذف التصنيف', 'success');
+                await renderCategories();
+                if (document.getElementById('page-products').classList.contains('active')) await renderProducts();
+                if (document.getElementById('page-itemcodes').classList.contains('active')) await renderItemCodes();
+                if (document.getElementById('page-inventory').classList.contains('active')) await renderInventory();
+                if (document.getElementById('page-pos').classList.contains('active')) await renderPOS();
+            } catch (e) {
+                console.error(e);
+                DBInstance.showToast('خطأ في حذف التصنيف: ' + e.message, 'error');
             }
-            await DBInstance.delete('categories', id);
-            DBInstance.showToast('تم حذف التصنيف', 'success');
-            await renderCategories();
-            if (document.getElementById('page-products').classList.contains('active')) await renderProducts();
-            if (document.getElementById('page-itemcodes').classList.contains('active')) await renderItemCodes();
-            if (document.getElementById('page-inventory').classList.contains('active')) await renderInventory();
-            if (document.getElementById('page-pos').classList.contains('active')) await renderPOS();
         }
 
         // ================================================================
@@ -1409,19 +1590,19 @@
                 const storeNames = ['users', 'settings', 'categories', 'inventoryItems', 'purchases', 'inventoryTransactions', 'products', 'recipeItems', 'orders', 'orderItems', 'auditLogs'];
                 const backupData = {};
                 for (let storeName of storeNames) {
-                    backupData[storeName] = await DBInstance.getAll(storeName);
+                    backupData[storeName] = await DBInstance.getAll(storeName) || [];
                 }
                 const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(backupData, null, 2));
                 const downloadAnchor = document.createElement('a');
                 downloadAnchor.setAttribute("href", dataStr);
-                downloadAnchor.setAttribute("download", `StoreManager_Backup_${new Date().toISOString().split('T')[0]}.json`);
+                downloadAnchor.setAttribute("download", "StoreManager_Backup_" + new Date().toISOString().split('T')[0] + ".json");
                 document.body.appendChild(downloadAnchor);
                 downloadAnchor.click();
                 downloadAnchor.remove();
                 DBInstance.showToast('تم إنشاء النسخة الاحتياطية وتحميلها بنجاح', 'success');
             } catch (err) {
                 console.error(err);
-                DBInstance.showToast('فشل إنشاء النسخة الاحتياطية', 'error');
+                DBInstance.showToast('فشل إنشاء النسخة الاحتياطية: ' + err.message, 'error');
             }
         }
 
@@ -1433,23 +1614,58 @@
                 try {
                     const backupData = JSON.parse(e.target.result);
                     await DBInstance.waitReady();
+
+                    // Validate backup structure
+                    const requiredStores = ['users', 'settings', 'categories', 'inventoryItems', 'products', 'recipeItems', 'orders', 'purchases'];
+                    for (let name of requiredStores) {
+                        if (!backupData[name]) {
+                            DBInstance.showToast('ملف النسخة الاحتياطية غير مكتمل (يفتقر إلى: ' + name + ')', 'error');
+                            return;
+                        }
+                    }
+
+                    // Clear existing data
                     const storeNames = Object.keys(backupData);
                     for (let storeName of storeNames) {
-                        // clear existing data
-                        const existing = await DBInstance.getAll(storeName);
+                        const existing = await DBInstance.getAll(storeName) || [];
                         for (let item of existing) {
                             await DBInstance.delete(storeName, item.id);
                         }
-                        // add new records
-                        for (let record of backupData[storeName]) {
-                            await DBInstance.add(storeName, record);
+                    }
+
+                    // Restore records preserving original IDs
+                    for (let storeName of storeNames) {
+                        const records = backupData[storeName] || [];
+                        for (let record of records) {
+                            if (record.id !== undefined && record.id !== null) {
+                                await DBInstance.put(storeName, record);
+                            } else {
+                                await DBInstance.add(storeName, record);
+                            }
                         }
                     }
+
+                    // Reload order number
+                    const orders = await DBInstance.getAll('orders');
+                    if (orders && orders.length > 0) {
+                        let maxNum = 0;
+                        for (let o of orders) {
+                            const numStr = String(o.orderNumber || '').replace('ORD-', '');
+                            const num = parseInt(numStr, 10);
+                            if (!isNaN(num) && num > maxNum) maxNum = num;
+                        }
+                        if (maxNum > 0) AppState.orderNumber = maxNum + 1;
+                    }
+
+                    // Reload settings
+                    const set = await DBInstance.get('settings', 1);
+                    if (set) AppState.settings = set;
+
                     DBInstance.showToast('تمت استعادة النسخة الاحتياطية بنجاح', 'success');
                     setTimeout(() => window.location.reload(), 1500);
                 } catch (err) {
                     console.error(err);
-                    DBInstance.showToast('ملف النسخة الاحتياطية غير صالح أو تالف', 'error');
+                    DBInstance.showToast('ملف النسخة الاحتياطية غير صالح أو تالف: ' + err.message, 'error');
                 }
             };
             reader.readAsText(file);
@@ -1460,138 +1676,209 @@
         // DASHBOARD
         // ================================================================
         async function renderDashboard() {
-            const today = new Date().toISOString().split('T')[0];
-            const orders = await DBInstance.getAll('orders');
-            const todayOrders = orders.filter(o => o.date === today && o.status === 'paid');
+            try {
+                await DBInstance.waitReady();
+                const today = new Date().toISOString().split('T')[0];
+                const orders = await DBInstance.getAll('orders') || [];
+                const todayOrders = orders.filter(o => o.date === today && o.status === 'paid');
 
-            const sales = todayOrders.reduce((sum, o) => sum + (o.grandTotal || 0), 0);
-            const profit = todayOrders.reduce((sum, o) => sum + (o.profit || 0), 0);
+                const sales = todayOrders.reduce((sum, o) => sum + (o.grandTotal || 0), 0);
+                const profit = todayOrders.reduce((sum, o) => sum + (o.profit || 0), 0);
 
-            document.getElementById('statTodaySales').textContent = sales.toFixed(2);
-            document.getElementById('statTodayOrders').textContent = todayOrders.length;
-            document.getElementById('statAvgOrder').textContent = todayOrders.length ? (sales / todayOrders.length).toFixed(2) : '0.00';
-            document.getElementById('statTodayProfit').textContent = profit.toFixed(2);
+                document.getElementById('statTodaySales').textContent = sales.toFixed(2);
+                document.getElementById('statTodayOrders').textContent = todayOrders.length;
+                document.getElementById('statAvgOrder').textContent = todayOrders.length ? (sales / todayOrders.length).toFixed(2) : '0.00';
+                document.getElementById('statTodayProfit').textContent = profit.toFixed(2);
 
-            const pSales = {};
-            todayOrders.forEach(o => o.items.forEach(i => pSales[i.name] = (pSales[i.name] || 0) + i.quantity));
-            const top = Object.entries(pSales).sort((a, b) => b[1] - a[1]).slice(0, 5);
-            document.getElementById('topProductsList').innerHTML = top.length ?
-                top.map(t => `<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #eee;"><span>${escapeHtml(t[0])}</span><span style="font-weight:bold;color:#0066cc;">${t[1]}</span></div>`).join('') :
-                '<p style="color:#999;text-align:center;">لا مبيعات اليوم</p>';
+                const pSales = {};
+                todayOrders.forEach(o => {
+                    if (o.items) {
+                        o.items.forEach(i => {
+                            pSales[i.name] = (pSales[i.name] || 0) + (i.quantity || 0);
+                        });
+                    }
+                });
+                const top = Object.entries(pSales).sort((a, b) => b[1] - a[1]).slice(0, 5);
+                document.getElementById('topProductsList').innerHTML = top.length ?
+                    top.map(t => '<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #eee;"><span>' + escapeHtml(t[0]) + '</span><span style="font-weight:bold;color:#0066cc;">' + t[1] + '</span></div>').join('') :
+                    '<p style="color:#999;text-align:center;">لا مبيعات اليوم</p>';
+            } catch (e) {
+                console.error(e);
+            }
         }
 
         // ================================================================
         // PRODUCTS & RECIPES
         // ================================================================
         async function renderProducts() {
-            const cats = await DBInstance.getAll('categories');
-            document.getElementById('productCategoryFilter').innerHTML = '<option value="all">الكل</option>' +
-                cats.map(c => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('');
+            try {
+                await DBInstance.waitReady();
+                const cats = await DBInstance.getAll('categories') || [];
+                const catFilter = document.getElementById('productCategoryFilter');
+                catFilter.innerHTML = '<option value="all">جميع التصنيفات</option>' +
+                    cats.map(c => '<option value="' + c.id + '">' + escapeHtml(c.name) + '</option>').join('');
 
-            const prods = await DBInstance.getAll('products');
-            const recipeItems = await DBInstance.getAll('recipeItems');
-            const invItems = await DBInstance.getAll('inventoryItems');
-            const invMap = {};
-            invItems.forEach(i => invMap[i.id] = i.unitCost || 0);
-            const catMap = {};
-            cats.forEach(c => catMap[c.id] = c.name);
+                const searchTerm = (document.getElementById('productSearch').value || '').toLowerCase().trim();
+                const categoryFilter = document.getElementById('productCategoryFilter').value;
+                const statusFilter = document.getElementById('productStatusFilter').value;
 
-            const tbody = document.getElementById('productsTableBody');
-            let html = '';
-            prods.forEach(p => {
-                let cost = 0;
-                recipeItems.filter(r => r.productId === p.id).forEach(r => {
-                    cost += (invMap[r.inventoryItemId] || 0) * r.quantity;
-                });
-                const profit = p.price - cost;
-                const margin = p.price > 0 ? ((profit / p.price) * 100) : 0;
-                html += `<tr>
-                    <td><strong>${escapeHtml(p.name)}</strong></td>
-                    <td>${escapeHtml(catMap[p.category] || '-')}</td>
-                    <td style="color:#0066cc;font-weight:bold;">${p.price.toFixed(2)}</td>
-                    <td>${cost.toFixed(2)}</td>
-                    <td style="color:${profit >= 0 ? '#00aa66' : '#cc0000'};">${profit.toFixed(2)}</td>
-                    <td>${margin.toFixed(1)}%</td>
-                    <td><span class="status-badge ${p.status === 'active' ? 'available' : 'out'}">${p.status === 'active' ? 'نشط' : 'موقوف'}</span></td>
-                    <td><button class="btn btn-primary btn-sm" onclick="editProduct(${p.id})">تعديل</button> <button class="btn btn-danger btn-sm" onclick="deleteProduct(${p.id})">حذف</button></td>
-                </tr>`;
-            });
-            tbody.innerHTML = html || '<tr><td colspan="8" style="text-align:center;">لا توجد منتجات</td></tr>';
+                let prods = await DBInstance.getAll('products') || [];
+                // Apply filters
+                if (searchTerm) {
+                    prods = prods.filter(p => (p.name || '').toLowerCase().includes(searchTerm));
+                }
+                if (categoryFilter !== 'all') {
+                    prods = prods.filter(p => p.category == categoryFilter);
+                }
+                if (statusFilter !== 'all') {
+                    prods = prods.filter(p => p.status === statusFilter);
+                }
+
+                const recipeItems = await DBInstance.getAll('recipeItems') || [];
+                const invItems = await DBInstance.getAll('inventoryItems') || [];
+                const invMap = {};
+                invItems.forEach(i => invMap[i.id] = i.unitCost || 0);
+                const catMap = {};
+                cats.forEach(c => catMap[c.id] = c.name);
+
+                const tbody = document.getElementById('productsTableBody');
+                if (!prods || prods.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;">لا توجد منتجات</td></tr>';
+                    return;
+                }
+                let html = '';
+                for (const p of prods) {
+                    let cost = 0;
+                    const myRecipes = recipeItems.filter(r => r.productId === p.id);
+                    myRecipes.forEach(r => {
+                        cost += (invMap[r.inventoryItemId] || 0) * (r.quantity || 0);
+                    });
+                    const price = p.price || 0;
+                    const profit = price - cost;
+                    const margin = price > 0 ? ((profit / price) * 100) : 0;
+                    html += '<tr>' +
+                        '<td><strong>' + escapeHtml(p.name) + '</strong></td>' +
+                        '<td>' + escapeHtml(catMap[p.category] || '-') + '</td>' +
+                        '<td style="color:#0066cc;font-weight:bold;">' + price.toFixed(2) + '</td>' +
+                        '<td>' + cost.toFixed(2) + '</td>' +
+                        '<td style="color:' + (profit >= 0 ? '#00aa66' : '#cc0000') + ';">' + profit.toFixed(2) + '</td>' +
+                        '<td>' + margin.toFixed(1) + '%</td>' +
+                        '<td><span class="status-badge ' + (p.status === 'active' ? 'available' : 'out') + '">' + (p.status === 'active' ? 'نشط' : 'موقوف') + '</span></td>' +
+                        '<td><button class="btn btn-primary btn-sm" onclick="editProduct(' + p.id + ')">تعديل</button> <button class="btn btn-danger btn-sm" onclick="deleteProduct(' + p.id + ')">حذف</button></td>' +
+                        '</tr>';
+                }
+                tbody.innerHTML = html;
+            } catch (e) {
+                console.error(e);
+                document.getElementById('productsTableBody').innerHTML = '<tr><td colspan="8" style="text-align:center;color:red;">خطأ في تحميل المنتجات</td></tr>';
+            }
         }
 
         async function showProductForm() {
-            document.getElementById('productFormTitle').textContent = 'منتج جديد للبيع';
-            document.getElementById('productFormId').value = '';
-            document.getElementById('pfName').value = '';
-            document.getElementById('pfPrice').value = '';
-            document.getElementById('pfTotalCostDisplay').textContent = '0.00';
-            document.getElementById('pfStatus').value = 'active';
+            try {
+                await DBInstance.waitReady();
+                document.getElementById('productFormTitle').textContent = 'منتج جديد للبيع';
+                document.getElementById('productFormId').value = '';
+                document.getElementById('pfName').value = '';
+                document.getElementById('pfPrice').value = '';
+                document.getElementById('pfTotalCostDisplay').textContent = '0.00';
+                document.getElementById('pfStatus').value = 'active';
 
-            const cats = await DBInstance.getAll('categories');
-            document.getElementById('pfCategory').innerHTML = cats.map(c => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('');
+                const cats = await DBInstance.getAll('categories') || [];
+                document.getElementById('pfCategory').innerHTML = cats.map(c =>
+                    '<option value="' + c.id + '">' + escapeHtml(c.name) + '</option>'
+                ).join('');
 
-            const items = await DBInstance.getAll('inventoryItems');
-            const opts = '<option value="" data-cost="0">اختر بنداً من المخزن...</option>' +
-                items.map(i => `<option value="${i.id}" data-cost="${i.unitCost || 0}">${escapeHtml(i.name)} (${(i.unitCost || 0).toFixed(2)})</option>`).join('');
-            document.getElementById('pfRecipeContainer').innerHTML =
-                `<div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;">
-                    <select class="pf-ingredient-item" style="flex:2;" onchange="updateProductLiveCost()">${opts}</select>
-                    <input type="number" class="pf-ingredient-qty" value="1" style="flex:1;" step="0.001" min="0" oninput="updateProductLiveCost()">
-                    <button type="button" class="btn btn-danger btn-sm" onclick="removeRecipeItem(this)">✕</button>
-                </div>`;
-            document.getElementById('productFormModal').classList.add('active');
+                const items = await DBInstance.getAll('inventoryItems') || [];
+                const opts = '<option value="" data-cost="0">اختر بنداً من المخزن...</option>' +
+                    items.map(i => '<option value="' + i.id + '" data-cost="' + (i.unitCost || 0) + '">' + escapeHtml(i.name) + ' (' + (i.unitCost || 0).toFixed(2) + ')</option>').join('');
+                document.getElementById('pfRecipeContainer').innerHTML =
+                    '<div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;">' +
+                    '<select class="pf-ingredient-item" style="flex:2;" onchange="updateProductLiveCost()">' + opts + '</select>' +
+                    '<input type="number" class="pf-ingredient-qty" value="1" style="flex:1;" step="0.001" min="0" oninput="updateProductLiveCost()">' +
+                    '<button type="button" class="btn btn-danger btn-sm" onclick="removeRecipeItem(this)">✕</button>' +
+                    '</div>';
+                document.getElementById('productFormModal').classList.add('active');
+            } catch (e) {
+                console.error(e);
+                DBInstance.showToast('خطأ في تحميل نموذج المنتج: ' + e.message, 'error');
+            }
         }
 
         async function editProduct(id) {
-            const p = await DBInstance.get('products', id);
-            if (!p) return;
-            document.getElementById('productFormTitle').textContent = 'تعديل المنتج';
-            document.getElementById('productFormId').value = id;
-            document.getElementById('pfName').value = p.name;
-            document.getElementById('pfPrice').value = p.price;
-            document.getElementById('pfStatus').value = p.status;
+            try {
+                await DBInstance.waitReady();
+                const p = await DBInstance.get('products', id);
+                if (!p) {
+                    DBInstance.showToast('المنتج غير موجود', 'error');
+                    return;
+                }
+                document.getElementById('productFormTitle').textContent = 'تعديل المنتج';
+                document.getElementById('productFormId').value = id;
+                document.getElementById('pfName').value = p.name || '';
+                document.getElementById('pfPrice').value = p.price || 0;
+                document.getElementById('pfStatus').value = p.status || 'active';
 
-            const cats = await DBInstance.getAll('categories');
-            document.getElementById('pfCategory').innerHTML = cats.map(c =>
-                `<option value="${c.id}" ${c.id === p.category ? 'selected' : ''}>${escapeHtml(c.name)}</option>`
-            ).join('');
+                const cats = await DBInstance.getAll('categories') || [];
+                document.getElementById('pfCategory').innerHTML = cats.map(c =>
+                    '<option value="' + c.id + '" ' + (c.id === p.category ? 'selected' : '') + '>' + escapeHtml(c.name) + '</option>'
+                ).join('');
 
-            const recipes = await DBInstance.getAll('recipeItems');
-            const myRecipes = recipes.filter(r => r.productId === id);
-            const items = await DBInstance.getAll('inventoryItems');
+                const recipes = await DBInstance.getAll('recipeItems') || [];
+                const myRecipes = recipes.filter(r => r.productId === id);
+                const items = await DBInstance.getAll('inventoryItems') || [];
 
-            let html = '';
-            myRecipes.forEach(ri => {
-                const opts = '<option value="" data-cost="0">اختر بنداً من المخزن...</option>' +
-                    items.map(i => `<option value="${i.id}" data-cost="${i.unitCost || 0}" ${i.id === ri.inventoryItemId ? 'selected' : ''}>${escapeHtml(i.name)} (${(i.unitCost || 0).toFixed(2)})</option>`).join('');
-                html += `<div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;">
-                    <select class="pf-ingredient-item" style="flex:2;" onchange="updateProductLiveCost()">${opts}</select>
-                    <input type="number" class="pf-ingredient-qty" value="${ri.quantity}" style="flex:1;" step="0.001" min="0" oninput="updateProductLiveCost()">
-                    <button type="button" class="btn btn-danger btn-sm" onclick="removeRecipeItem(this)">✕</button>
-                </div>`;
-            });
-            document.getElementById('pfRecipeContainer').innerHTML = html;
-            updateProductLiveCost();
-            document.getElementById('productFormModal').classList.add('active');
+                let html = '';
+                if (myRecipes.length === 0) {
+                    const opts = '<option value="" data-cost="0">اختر بنداً من المخزن...</option>' +
+                        items.map(i => '<option value="' + i.id + '" data-cost="' + (i.unitCost || 0) + '">' + escapeHtml(i.name) + ' (' + (i.unitCost || 0).toFixed(2) + ')</option>').join('');
+                    html = '<div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;">' +
+                        '<select class="pf-ingredient-item" style="flex:2;" onchange="updateProductLiveCost()">' + opts + '</select>' +
+                        '<input type="number" class="pf-ingredient-qty" value="1" style="flex:1;" step="0.001" min="0" oninput="updateProductLiveCost()">' +
+                        '<button type="button" class="btn btn-danger btn-sm" onclick="removeRecipeItem(this)">✕</button>' +
+                        '</div>';
+                } else {
+                    myRecipes.forEach(ri => {
+                        const opts = '<option value="" data-cost="0">اختر بنداً من المخزن...</option>' +
+                            items.map(i => '<option value="' + i.id + '" data-cost="' + (i.unitCost || 0) + '" ' + (i.id === ri.inventoryItemId ? 'selected' : '') + '>' + escapeHtml(i.name) + ' (' + (i.unitCost || 0).toFixed(2) + ')</option>').join('');
+                        html += '<div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;">' +
+                            '<select class="pf-ingredient-item" style="flex:2;" onchange="updateProductLiveCost()">' + opts + '</select>' +
+                            '<input type="number" class="pf-ingredient-qty" value="' + (ri.quantity || 1) + '" style="flex:1;" step="0.001" min="0" oninput="updateProductLiveCost()">' +
+                            '<button type="button" class="btn btn-danger btn-sm" onclick="removeRecipeItem(this)">✕</button>' +
+                            '</div>';
+                    });
+                }
+                document.getElementById('pfRecipeContainer').innerHTML = html;
+                updateProductLiveCost();
+                document.getElementById('productFormModal').classList.add('active');
+            } catch (e) {
+                console.error(e);
+                DBInstance.showToast('خطأ في تحميل المنتج: ' + e.message, 'error');
+            }
         }
 
         async function addRecipeItem() {
-            const items = await DBInstance.getAll('inventoryItems');
-            const opts = '<option value="" data-cost="0">اختر بنداً من المخزن...</option>' +
-                items.map(i => `<option value="${i.id}" data-cost="${i.unitCost || 0}">${escapeHtml(i.name)} (${(i.unitCost || 0).toFixed(2)})</option>`).join('');
-            const container = document.getElementById('pfRecipeContainer');
-            const div = document.createElement('div');
-            div.style.cssText = 'display:flex;gap:8px;margin-bottom:8px;align-items:center;';
-            div.innerHTML = `
-                <select class="pf-ingredient-item" style="flex:2;" onchange="updateProductLiveCost()">${opts}</select>
-                <input type="number" class="pf-ingredient-qty" value="1" style="flex:1;" step="0.001" min="0" oninput="updateProductLiveCost()">
-                <button type="button" class="btn btn-danger btn-sm" onclick="removeRecipeItem(this)">✕</button>
-            `;
-            container.appendChild(div);
+            try {
+                await DBInstance.waitReady();
+                const items = await DBInstance.getAll('inventoryItems') || [];
+                const opts = '<option value="" data-cost="0">اختر بنداً من المخزن...</option>' +
+                    items.map(i => '<option value="' + i.id + '" data-cost="' + (i.unitCost || 0) + '">' + escapeHtml(i.name) + ' (' + (i.unitCost || 0).toFixed(2) + ')</option>').join('');
+                const container = document.getElementById('pfRecipeContainer');
+                const div = document.createElement('div');
+                div.style.cssText = 'display:flex;gap:8px;margin-bottom:8px;align-items:center;';
+                div.innerHTML = '<select class="pf-ingredient-item" style="flex:2;" onchange="updateProductLiveCost()">' + opts + '</select>' +
+                    '<input type="number" class="pf-ingredient-qty" value="1" style="flex:1;" step="0.001" min="0" oninput="updateProductLiveCost()">' +
+                    '<button type="button" class="btn btn-danger btn-sm" onclick="removeRecipeItem(this)">✕</button>';
+                container.appendChild(div);
+            } catch (e) {
+                console.error(e);
+                DBInstance.showToast('خطأ في إضافة مكون: ' + e.message, 'error');
+            }
         }
 
         function removeRecipeItem(btn) {
-            btn.closest('div').remove();
+            const row = btn.closest('div');
+            if (row) row.remove();
             updateProductLiveCost();
         }
 
@@ -1599,10 +1886,10 @@
             let tot = 0;
             document.querySelectorAll('#pfRecipeContainer > div').forEach(row => {
                 const sel = row.querySelector('select');
-                const qty = row.querySelector('input');
-                if (sel && qty && sel.value) {
+                const qtyInput = row.querySelector('input');
+                if (sel && qtyInput && sel.value) {
                     const cost = parseFloat(sel.options[sel.selectedIndex].dataset.cost) || 0;
-                    const qtyVal = parseFloat(qty.value) || 0;
+                    const qtyVal = parseFloat(qtyInput.value) || 0;
                     tot += cost * qtyVal;
                 }
             });
@@ -1612,49 +1899,67 @@
 
         function calculateProductPrice() {
             const cost = updateProductLiveCost();
-            const margin = AppState.settings.profitMargin || 40;
-            document.getElementById('pfPrice').value = (cost * (1 + margin / 100)).toFixed(2);
+            const margin = (AppState.settings && AppState.settings.profitMargin) || 40;
+            const price = cost * (1 + margin / 100);
+            document.getElementById('pfPrice').value = price.toFixed(2);
         }
 
         async function saveProduct(e) {
             e.preventDefault();
-            const id = document.getElementById('productFormId').value;
-            const p = {
-                name: document.getElementById('pfName').value,
-                category: parseInt(document.getElementById('pfCategory').value),
-                price: parseFloat(document.getElementById('pfPrice').value),
-                status: document.getElementById('pfStatus').value
-            };
-            let savedId;
-            if (id) {
-                p.id = parseInt(id);
-                await DBInstance.put('products', p);
-                savedId = p.id;
-            } else {
-                savedId = await DBInstance.add('products', p);
-            }
+            try {
+                await DBInstance.waitReady();
+                const id = document.getElementById('productFormId').value;
+                const p = {
+                    name: document.getElementById('pfName').value.trim(),
+                    category: parseInt(document.getElementById('pfCategory').value) || 0,
+                    price: parseFloat(document.getElementById('pfPrice').value) || 0,
+                    status: document.getElementById('pfStatus').value
+                };
+                if (!p.name) {
+                    DBInstance.showToast('اسم المنتج مطلوب', 'warning');
+                    return;
+                }
+                if (p.price <= 0) {
+                    DBInstance.showToast('سعر البيع يجب أن يكون أكبر من صفر', 'warning');
+                    return;
+                }
 
-            const oldRec = (await DBInstance.getAll('recipeItems')).filter(r => r.productId === savedId);
-            for (let r of oldRec) {
-                await DBInstance.delete('recipeItems', r.id);
-            }
+                let savedId;
+                if (id) {
+                    p.id = parseInt(id);
+                    await DBInstance.put('products', p);
+                    savedId = p.id;
+                } else {
+                    savedId = await DBInstance.add('products', p);
+                }
 
-            const rows = document.querySelectorAll('#pfRecipeContainer > div');
-            for (const row of rows) {
-                const sel = row.querySelector('select');
-                const qtyInput = row.querySelector('input');
-                if (sel && qtyInput) {
-                    const invId = parseInt(sel.value);
-                    const qty = parseFloat(qtyInput.value);
-                    if (invId && qty > 0) {
-                        await DBInstance.add('recipeItems', { productId: savedId, inventoryItemId: invId, quantity: qty });
+                // Delete old recipe items
+                const oldRec = (await DBInstance.getAll('recipeItems') || []).filter(r => r.productId === savedId);
+                for (let r of oldRec) {
+                    await DBInstance.delete('recipeItems', r.id);
+                }
+
+                // Add new recipe items
+                const rows = document.querySelectorAll('#pfRecipeContainer > div');
+                for (const row of rows) {
+                    const sel = row.querySelector('select');
+                    const qtyInput = row.querySelector('input');
+                    if (sel && qtyInput) {
+                        const invId = parseInt(sel.value);
+                        const qty = parseFloat(qtyInput.value) || 0;
+                        if (invId && qty > 0) {
+                            await DBInstance.add('recipeItems', { productId: savedId, inventoryItemId: invId, quantity: qty });
+                        }
                     }
                 }
-            }
 
-            closeProductForm();
-            DBInstance.showToast('تم الحفظ', 'success');
-            await renderProducts();
+                closeProductForm();
+                DBInstance.showToast('تم حفظ المنتج', 'success');
+                await renderProducts();
+            } catch (e) {
+                console.error(e);
+                DBInstance.showToast('خطأ في حفظ المنتج: ' + e.message, 'error');
+            }
         }
 
         function closeProductForm() {
@@ -1662,9 +1967,21 @@
         }
 
         async function deleteProduct(id) {
-            if (confirm('هل أنت متأكد؟')) {
+            if (!confirm('هل أنت متأكد من حذف هذا المنتج؟')) return;
+            try {
+                await DBInstance.waitReady();
+                // Delete recipe items
+                const recipes = await DBInstance.getAll('recipeItems') || [];
+                const toDelete = recipes.filter(r => r.productId === id);
+                for (let r of toDelete) {
+                    await DBInstance.delete('recipeItems', r.id);
+                }
                 await DBInstance.delete('products', id);
+                DBInstance.showToast('تم حذف المنتج', 'success');
                 await renderProducts();
+            } catch (e) {
+                console.error(e);
+                DBInstance.showToast('خطأ في حذف المنتج: ' + e.message, 'error');
             }
         }
 
@@ -1672,98 +1989,180 @@
         // INVENTORY (ITEM CODES & STOCK)
         // ================================================================
         async function renderItemCodes() {
-            const items = await DBInstance.getAll('inventoryItems');
-            const cats = await DBInstance.getAll('categories');
-            const catMap = {};
-            cats.forEach(c => catMap[c.id] = c.name);
-            document.getElementById('itemCodesTableBody').innerHTML = items.map(i =>
-                `<tr>
-                    <td>${escapeHtml(i.sku || '-')}</td>
-                    <td><strong>${escapeHtml(i.name)}</strong></td>
-                    <td>${escapeHtml(catMap[i.category] || '-')}</td>
-                    <td>${escapeHtml(i.unit)}</td>
-                    <td>${(i.unitCost || 0).toFixed(2)}</td>
-                    <td>${escapeHtml(i.supplier || '-')}</td>
-                    <td><button class="btn btn-primary btn-sm" onclick="editInventoryItem(${i.id})">تعديل</button></td>
-                </tr>`
-            ).join('') || '<tr><td colspan="7" style="text-align:center;">لا توجد بنود</td></tr>';
+            try {
+                await DBInstance.waitReady();
+                const searchTerm = (document.getElementById('itemCodeSearch').value || '').toLowerCase().trim();
+                const categoryFilter = document.getElementById('itemCodeCategoryFilter').value;
+
+                let items = await DBInstance.getAll('inventoryItems') || [];
+                if (searchTerm) {
+                    items = items.filter(i =>
+                        (i.name || '').toLowerCase().includes(searchTerm) ||
+                        (i.sku || '').toLowerCase().includes(searchTerm)
+                    );
+                }
+                if (categoryFilter !== 'all') {
+                    items = items.filter(i => i.category == categoryFilter);
+                }
+
+                const cats = await DBInstance.getAll('categories') || [];
+                const catMap = {};
+                cats.forEach(c => catMap[c.id] = c.name);
+
+                const tbody = document.getElementById('itemCodesTableBody');
+                if (!items || items.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;">لا توجد بنود</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = items.map(i =>
+                    '<tr>' +
+                    '<td>' + escapeHtml(i.sku || '-') + '</td>' +
+                    '<td><strong>' + escapeHtml(i.name) + '</strong></td>' +
+                    '<td>' + escapeHtml(catMap[i.category] || '-') + '</td>' +
+                    '<td>' + escapeHtml(i.unit) + '</td>' +
+                    '<td>' + (i.unitCost || 0).toFixed(2) + '</td>' +
+                    '<td>' + escapeHtml(i.supplier || '-') + '</td>' +
+                    '<td><button class="btn btn-primary btn-sm" onclick="editInventoryItem(' + i.id + ')">تعديل</button></td>' +
+                    '</tr>'
+                ).join('');
+            } catch (e) {
+                console.error(e);
+                document.getElementById('itemCodesTableBody').innerHTML = '<tr><td colspan="7" style="text-align:center;color:red;">خطأ في تحميل البنود</td></tr>';
+            }
         }
 
         async function renderInventory() {
-            const items = await DBInstance.getAll('inventoryItems');
-            const cats = await DBInstance.getAll('categories');
-            const catMap = {};
-            cats.forEach(c => catMap[c.id] = c.name);
-            document.getElementById('inventoryTableBody').innerHTML = items.map(i =>
-                `<tr>
-                    <td><strong>${escapeHtml(i.name)}</strong></td>
-                    <td>${escapeHtml(catMap[i.category] || '-')}</td>
-                    <td style="color:${i.quantity <= i.minStock ? '#cc0000' : '#1a1a1a'}; font-weight:bold;">${i.quantity}</td>
-                    <td>${escapeHtml(i.unit)}</td>
-                    <td>${(i.unitCost || 0).toFixed(2)}</td>
-                    <td>${(i.quantity * (i.unitCost || 0)).toFixed(2)}</td>
-                    <td><span class="status-badge ${i.quantity > i.minStock ? 'available' : 'out'}">${i.quantity > 0 ? 'متوفر' : 'نفد'}</span></td>
-                    <td><button class="btn btn-danger btn-sm" onclick="adjustStock(${i.id})">تسوية</button></td>
-                </tr>`
-            ).join('') || '<tr><td colspan="8" style="text-align:center;">لا يوجد مخزون</td></tr>';
+            try {
+                await DBInstance.waitReady();
+                const searchTerm = (document.getElementById('inventorySearch').value || '').toLowerCase().trim();
+                const categoryFilter = document.getElementById('inventoryCategoryFilter').value;
+
+                let items = await DBInstance.getAll('inventoryItems') || [];
+                if (searchTerm) {
+                    items = items.filter(i => (i.name || '').toLowerCase().includes(searchTerm));
+                }
+                if (categoryFilter !== 'all') {
+                    items = items.filter(i => i.category == categoryFilter);
+                }
+
+                const cats = await DBInstance.getAll('categories') || [];
+                const catMap = {};
+                cats.forEach(c => catMap[c.id] = c.name);
+
+                const tbody = document.getElementById('inventoryTableBody');
+                if (!items || items.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;">لا يوجد مخزون</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = items.map(i => {
+                    const qty = i.quantity || 0;
+                    const minStock = i.minStock || 0;
+                    const unitCost = i.unitCost || 0;
+                    const statusClass = qty > minStock ? 'available' : 'out';
+                    const statusText = qty > 0 ? 'متوفر' : 'نفد';
+                    return '<tr>' +
+                        '<td><strong>' + escapeHtml(i.name) + '</strong></td>' +
+                        '<td>' + escapeHtml(catMap[i.category] || '-') + '</td>' +
+                        '<td style="color:' + (qty <= minStock ? '#cc0000' : '#1a1a1a') + '; font-weight:bold;">' + qty + '</td>' +
+                        '<td>' + escapeHtml(i.unit) + '</td>' +
+                        '<td>' + unitCost.toFixed(2) + '</td>' +
+                        '<td>' + (qty * unitCost).toFixed(2) + '</td>' +
+                        '<td><span class="status-badge ' + statusClass + '">' + statusText + '</span></td>' +
+                        '<td><button class="btn btn-danger btn-sm" onclick="adjustStock(' + i.id + ')">تسوية</button></td>' +
+                        '</tr>';
+                }).join('');
+            } catch (e) {
+                console.error(e);
+                document.getElementById('inventoryTableBody').innerHTML = '<tr><td colspan="8" style="text-align:center;color:red;">خطأ في تحميل المخزون</td></tr>';
+            }
         }
 
         async function showInventoryItemForm() {
-            document.getElementById('inventoryFormTitle').textContent = 'تكويد صنف جديد';
-            document.getElementById('ifId').value = '';
-            ['ifName', 'ifSku', 'ifQuantity', 'ifUnitCost', 'ifMinStock', 'ifMaxStock', 'ifSupplier', 'ifNotes'].forEach(id => {
-                document.getElementById(id).value = (id.includes('Stock') || id.includes('Cost') || id === 'ifQuantity') ? '0' : '';
-            });
-            const cats = await DBInstance.getAll('categories');
-            document.getElementById('ifCategory').innerHTML = cats.map(c => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('');
-            document.getElementById('inventoryFormModal').classList.add('active');
+            try {
+                await DBInstance.waitReady();
+                document.getElementById('inventoryFormTitle').textContent = 'تكويد صنف جديد';
+                document.getElementById('ifId').value = '';
+                ['ifName', 'ifSku', 'ifQuantity', 'ifUnitCost', 'ifMinStock', 'ifMaxStock', 'ifSupplier', 'ifNotes'].forEach(id => {
+                    document.getElementById(id).value = (id.includes('Stock') || id.includes('Cost') || id === 'ifQuantity') ? '0' : '';
+                });
+                const cats = await DBInstance.getAll('categories') || [];
+                document.getElementById('ifCategory').innerHTML = cats.map(c =>
+                    '<option value="' + c.id + '">' + escapeHtml(c.name) + '</option>'
+                ).join('');
+                document.getElementById('inventoryFormModal').classList.add('active');
+            } catch (e) {
+                console.error(e);
+                DBInstance.showToast('خطأ في تحميل النموذج: ' + e.message, 'error');
+            }
         }
 
         async function editInventoryItem(id) {
-            const i = await DBInstance.get('inventoryItems', id);
-            if (!i) return;
-            document.getElementById('ifId').value = i.id;
-            document.getElementById('ifName').value = i.name;
-            document.getElementById('ifSku').value = i.sku || '';
-            document.getElementById('ifUnit').value = i.unit;
-            document.getElementById('ifQuantity').value = i.quantity;
-            document.getElementById('ifUnitCost').value = i.unitCost;
-            document.getElementById('ifMinStock').value = i.minStock || 0;
-            document.getElementById('ifMaxStock').value = i.maxStock || 0;
-            document.getElementById('ifSupplier').value = i.supplier || '';
-            document.getElementById('ifNotes').value = i.notes || '';
-            const cats = await DBInstance.getAll('categories');
-            document.getElementById('ifCategory').innerHTML = cats.map(c =>
-                `<option value="${c.id}" ${c.id === i.category ? 'selected' : ''}>${escapeHtml(c.name)}</option>`
-            ).join('');
-            document.getElementById('inventoryFormModal').classList.add('active');
+            try {
+                await DBInstance.waitReady();
+                const i = await DBInstance.get('inventoryItems', id);
+                if (!i) {
+                    DBInstance.showToast('الصنف غير موجود', 'error');
+                    return;
+                }
+                document.getElementById('ifId').value = i.id;
+                document.getElementById('ifName').value = i.name || '';
+                document.getElementById('ifSku').value = i.sku || '';
+                document.getElementById('ifUnit').value = i.unit || 'قطعة';
+                document.getElementById('ifQuantity').value = i.quantity || 0;
+                document.getElementById('ifUnitCost').value = i.unitCost || 0;
+                document.getElementById('ifMinStock').value = i.minStock || 0;
+                document.getElementById('ifMaxStock').value = i.maxStock || 0;
+                document.getElementById('ifSupplier').value = i.supplier || '';
+                document.getElementById('ifNotes').value = i.notes || '';
+                const cats = await DBInstance.getAll('categories') || [];
+                document.getElementById('ifCategory').innerHTML = cats.map(c =>
+                    '<option value="' + c.id + '" ' + (c.id === i.category ? 'selected' : '') + '>' + escapeHtml(c.name) + '</option>'
+                ).join('');
+                document.getElementById('inventoryFormModal').classList.add('active');
+            } catch (e) {
+                console.error(e);
+                DBInstance.showToast('خطأ في تحميل الصنف: ' + e.message, 'error');
+            }
         }
 
         async function saveInventoryItem(e) {
             e.preventDefault();
-            const id = document.getElementById('ifId').value;
-            const item = {
-                name: document.getElementById('ifName').value,
-                sku: document.getElementById('ifSku').value,
-                category: parseInt(document.getElementById('ifCategory').value),
-                unit: document.getElementById('ifUnit').value,
-                quantity: parseFloat(document.getElementById('ifQuantity').value) || 0,
-                unitCost: parseFloat(document.getElementById('ifUnitCost').value) || 0,
-                minStock: parseFloat(document.getElementById('ifMinStock').value) || 0,
-                maxStock: parseFloat(document.getElementById('ifMaxStock').value) || 0,
-                supplier: document.getElementById('ifSupplier').value,
-                notes: document.getElementById('ifNotes').value
-            };
-            if (id) {
-                item.id = parseInt(id);
-                await DBInstance.put('inventoryItems', item);
-            } else {
-                await DBInstance.add('inventoryItems', item);
+            try {
+                await DBInstance.waitReady();
+                const id = document.getElementById('ifId').value;
+                const name = document.getElementById('ifName').value.trim();
+                if (!name) {
+                    DBInstance.showToast('اسم الصنف مطلوب', 'warning');
+                    return;
+                }
+                const item = {
+                    name: name,
+                    sku: document.getElementById('ifSku').value.trim() || '',
+                    category: parseInt(document.getElementById('ifCategory').value) || 0,
+                    unit: document.getElementById('ifUnit').value || 'قطعة',
+                    quantity: parseFloat(document.getElementById('ifQuantity').value) || 0,
+                    unitCost: parseFloat(document.getElementById('ifUnitCost').value) || 0,
+                    minStock: parseFloat(document.getElementById('ifMinStock').value) || 0,
+                    maxStock: parseFloat(document.getElementById('ifMaxStock').value) || 0,
+                    supplier: document.getElementById('ifSupplier').value.trim() || '',
+                    notes: document.getElementById('ifNotes').value.trim() || ''
+                };
+                if (id) {
+                    item.id = parseInt(id);
+                    await DBInstance.put('inventoryItems', item);
+                } else {
+                    await DBInstance.add('inventoryItems', item);
+                }
+                closeInventoryForm();
+                DBInstance.showToast('تم حفظ الصنف', 'success');
+                await renderItemCodes();
+                await renderInventory();
+                // Update category filter dropdowns
+                await updateCategoryFilters();
+            } catch (e) {
+                console.error(e);
+                DBInstance.showToast('خطأ في حفظ الصنف: ' + e.message, 'error');
             }
-            closeInventoryForm();
-            DBInstance.showToast('تم الحفظ', 'success');
-            await renderItemCodes();
-            await renderInventory();
         }
 
         function closeInventoryForm() {
@@ -1771,15 +2170,62 @@
         }
 
         async function adjustStock(id) {
-            const i = await DBInstance.get('inventoryItems', id);
-            if (!i) return;
-            const qtyStr = prompt(`تسوية الجرد للصنف (${i.name}).\nالرصيد الحالي بالمخزن هو: ${i.quantity}\nأدخل الرصيد الفعلي الجديد:`, i.quantity);
-            if (qtyStr !== null && qtyStr.trim() !== '' && !isNaN(qtyStr)) {
+            try {
+                await DBInstance.waitReady();
+                const i = await DBInstance.get('inventoryItems', id);
+                if (!i) {
+                    DBInstance.showToast('الصنف غير موجود', 'error');
+                    return;
+                }
+                const currentQty = i.quantity || 0;
+                const qtyStr = prompt('تسوية الجرد للصنف (' + i.name + ').\nالرصيد الحالي بالمخزن هو: ' + currentQty + '\nأدخل الرصيد الفعلي الجديد:', currentQty);
+                if (qtyStr === null) return;
                 const qty = parseFloat(qtyStr);
+                if (isNaN(qty) || qty < 0) {
+                    DBInstance.showToast('القيمة غير صالحة (يجب أن تكون رقماً موجباً)', 'warning');
+                    return;
+                }
+                const oldQty = i.quantity;
                 i.quantity = qty;
                 await DBInstance.put('inventoryItems', i);
+
+                // Log transaction
+                await DBInstance.add('inventoryTransactions', {
+                    itemId: i.id,
+                    itemName: i.name,
+                    type: 'adjustment',
+                    oldQuantity: oldQty,
+                    newQuantity: qty,
+                    date: new Date().toISOString().split('T')[0],
+                    note: 'تسوية جرد يدوية'
+                });
+
                 DBInstance.showToast('تمت التسوية', 'success');
                 await renderInventory();
+            } catch (e) {
+                console.error(e);
+                DBInstance.showToast('خطأ في تسوية الجرد: ' + e.message, 'error');
+            }
+        }
+
+        async function updateCategoryFilters() {
+            try {
+                await DBInstance.waitReady();
+                const cats = await DBInstance.getAll('categories') || [];
+                const catOptions = '<option value="all">جميع التصنيفات</option>' +
+                    cats.map(c => '<option value="' + c.id + '">' + escapeHtml(c.name) + '</option>').join('');
+
+                const filterIds = ['itemCodeCategoryFilter', 'inventoryCategoryFilter', 'productCategoryFilter'];
+                for (let id of filterIds) {
+                    const el = document.getElementById(id);
+                    if (el) {
+                        const current = el.value;
+                        el.innerHTML = catOptions;
+                        if (current) el.value = current;
+                    }
+                }
+            } catch (e) {
+                console.error(e);
             }
         }
 
@@ -1787,30 +2233,57 @@
         // PURCHASES
         // ================================================================
         async function renderPurchases() {
-            const purs = await DBInstance.getAll('purchases');
-            purs.sort((a, b) => b.id - a.id);
-            document.getElementById('purchasesTableBody').innerHTML = purs.map(p =>
-                `<tr>
-                    <td>${escapeHtml(p.date)}</td>
-                    <td><strong>${escapeHtml(p.itemName)}</strong></td>
-                    <td style="color:#00aa66;font-weight:bold;">+${p.quantity}</td>
-                    <td>${escapeHtml(p.unit)}</td>
-                    <td>${p.price.toFixed(2)}</td>
-                    <td>${p.total.toFixed(2)}</td>
-                    <td>${escapeHtml(p.supplier)}</td>
-                </tr>`
-            ).join('') || '<tr><td colspan="7" style="text-align:center;">لا توجد فواتير مشتريات</td></tr>';
+            try {
+                await DBInstance.waitReady();
+                const dateFrom = document.getElementById('purchaseDateFrom').value;
+                const dateTo = document.getElementById('purchaseDateTo').value;
+
+                let purs = await DBInstance.getAll('purchases') || [];
+                if (dateFrom) {
+                    purs = purs.filter(p => p.date >= dateFrom);
+                }
+                if (dateTo) {
+                    purs = purs.filter(p => p.date <= dateTo);
+                }
+                purs.sort((a, b) => (b.id || 0) - (a.id || 0));
+
+                const tbody = document.getElementById('purchasesTableBody');
+                if (!purs || purs.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;">لا توجد فواتير مشتريات</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = purs.map(p =>
+                    '<tr>' +
+                    '<td>' + escapeHtml(p.date || '-') + '</td>' +
+                    '<td><strong>' + escapeHtml(p.itemName || '') + '</strong></td>' +
+                    '<td style="color:#00aa66;font-weight:bold;">+' + (p.quantity || 0) + '</td>' +
+                    '<td>' + escapeHtml(p.unit || '') + '</td>' +
+                    '<td>' + (p.price || 0).toFixed(2) + '</td>' +
+                    '<td>' + (p.total || 0).toFixed(2) + '</td>' +
+                    '<td>' + escapeHtml(p.supplier || '-') + '</td>' +
+                    '</tr>'
+                ).join('');
+            } catch (e) {
+                console.error(e);
+                document.getElementById('purchasesTableBody').innerHTML = '<tr><td colspan="7" style="text-align:center;color:red;">خطأ في تحميل المشتريات</td></tr>';
+            }
         }
 
         async function showPurchaseForm() {
-            document.getElementById('purchaseQty').value = '';
-            document.getElementById('purchasePrice').value = '';
-            document.getElementById('purchaseDate').value = new Date().toISOString().split('T')[0];
-            const items = await DBInstance.getAll('inventoryItems');
-            document.getElementById('purchaseItem').innerHTML = items.map(i =>
-                `<option value="${i.id}">${escapeHtml(i.name)} (متوسط التكلفة الحالي: ${i.unitCost.toFixed(2)})</option>`
-            ).join('');
-            document.getElementById('purchaseFormModal').classList.add('active');
+            try {
+                await DBInstance.waitReady();
+                document.getElementById('purchaseQty').value = '';
+                document.getElementById('purchasePrice').value = '';
+                document.getElementById('purchaseDate').value = new Date().toISOString().split('T')[0];
+                const items = await DBInstance.getAll('inventoryItems') || [];
+                document.getElementById('purchaseItem').innerHTML = items.map(i =>
+                    '<option value="' + i.id + '">' + escapeHtml(i.name) + ' (متوسط التكلفة الحالي: ' + (i.unitCost || 0).toFixed(2) + ')</option>'
+                ).join('');
+                document.getElementById('purchaseFormModal').classList.add('active');
+            } catch (e) {
+                console.error(e);
+                DBInstance.showToast('خطأ في تحميل نموذج الشراء: ' + e.message, 'error');
+            }
         }
 
         function closePurchaseForm() {
@@ -1819,144 +2292,212 @@
 
         async function savePurchase(e) {
             e.preventDefault();
-            const id = parseInt(document.getElementById('purchaseItem').value);
-            const qty = parseFloat(document.getElementById('purchaseQty').value);
-            const price = parseFloat(document.getElementById('purchasePrice').value);
-            const item = await DBInstance.get('inventoryItems', id);
-            if (!item) return;
+            try {
+                await DBInstance.waitReady();
+                const itemId = parseInt(document.getElementById('purchaseItem').value);
+                const qty = parseFloat(document.getElementById('purchaseQty').value);
+                const price = parseFloat(document.getElementById('purchasePrice').value);
 
-            const newAvg = ((item.quantity * item.unitCost) + (qty * price)) / (item.quantity + qty);
-            item.quantity += qty;
-            item.unitCost = newAvg;
-            await DBInstance.put('inventoryItems', item);
+                if (!itemId) {
+                    DBInstance.showToast('اختر صنفاً', 'warning');
+                    return;
+                }
+                if (!qty || qty <= 0) {
+                    DBInstance.showToast('الكمية يجب أن تكون أكبر من صفر', 'warning');
+                    return;
+                }
+                if (!price || price <= 0) {
+                    DBInstance.showToast('السعر يجب أن يكون أكبر من صفر', 'warning');
+                    return;
+                }
 
-            await DBInstance.add('purchases', {
-                itemId: id,
-                itemName: item.name,
-                quantity: qty,
-                unit: item.unit,
-                price: price,
-                total: qty * price,
-                supplier: document.getElementById('purchaseSupplier').value,
-                date: document.getElementById('purchaseDate').value
-            });
-            closePurchaseForm();
-            DBInstance.showToast('تم الشراء وتحديث الرصيد والمتوسط', 'success');
-            await renderPurchases();
-            await renderInventory();
+                const item = await DBInstance.get('inventoryItems', itemId);
+                if (!item) {
+                    DBInstance.showToast('الصنف غير موجود', 'error');
+                    return;
+                }
+
+                const oldQty = item.quantity || 0;
+                const oldCost = item.unitCost || 0;
+                const newTotalCost = (oldQty * oldCost) + (qty * price);
+                const newQty = oldQty + qty;
+                const newAvgCost = newQty > 0 ? newTotalCost / newQty : 0;
+
+                item.quantity = newQty;
+                item.unitCost = newAvgCost;
+                await DBInstance.put('inventoryItems', item);
+
+                await DBInstance.add('purchases', {
+                    itemId: itemId,
+                    itemName: item.name,
+                    quantity: qty,
+                    unit: item.unit || 'قطعة',
+                    price: price,
+                    total: qty * price,
+                    supplier: document.getElementById('purchaseSupplier').value.trim() || '',
+                    date: document.getElementById('purchaseDate').value || new Date().toISOString().split('T')[0]
+                });
+
+                await DBInstance.add('inventoryTransactions', {
+                    itemId: itemId,
+                    itemName: item.name,
+                    type: 'purchase',
+                    quantity: qty,
+                    unitCost: price,
+                    totalCost: qty * price,
+                    date: new Date().toISOString().split('T')[0],
+                    note: 'فاتورة شراء'
+                });
+
+                closePurchaseForm();
+                DBInstance.showToast('تم الشراء وتحديث الرصيد والمتوسط', 'success');
+                await renderPurchases();
+                await renderInventory();
+            } catch (e) {
+                console.error(e);
+                DBInstance.showToast('خطأ في حفظ الشراء: ' + e.message, 'error');
+            }
         }
 
         // ================================================================
         // POS (CART & CHECKOUT)
         // ================================================================
         async function renderPOS() {
-            const cats = await DBInstance.getAll('categories');
-            document.getElementById('posCategories').innerHTML =
-                `<button class="cat-btn active" onclick="filterPosProducts('all')">الكل</button>` +
-                cats.map(c => `<button class="cat-btn" data-cat="${c.id}" onclick="filterPosProducts('${c.id}')">${escapeHtml(c.name)}</button>`).join('');
-            await loadPosProducts();
-            updateCartDisplay();
+            try {
+                await DBInstance.waitReady();
+                const cats = await DBInstance.getAll('categories') || [];
+                document.getElementById('posCategories').innerHTML =
+                    '<button class="cat-btn active" data-cat="all" onclick="filterPosProducts(\'all\')">الكل</button>' +
+                    cats.map(c => '<button class="cat-btn" data-cat="' + c.id + '" onclick="filterPosProducts(\'' + c.id + '\')">' + escapeHtml(c.name) + '</button>').join('');
+                await loadPosProducts();
+                updateCartDisplay();
+            } catch (e) {
+                console.error(e);
+                DBInstance.showToast('خطأ في تحميل نقطة البيع: ' + e.message, 'error');
+            }
         }
 
         async function filterPosProducts(c) {
             AppState.selectedCategory = c;
             document.querySelectorAll('.cat-btn').forEach(b => {
-                b.classList.toggle('active', b.dataset.cat == c || (c === 'all' && !b.dataset.cat));
+                const cat = b.dataset.cat;
+                b.classList.toggle('active', cat == c || (c === 'all' && !cat));
             });
             await loadPosProducts();
         }
 
         async function loadPosProducts() {
-            const allProds = await DBInstance.getAll('products');
-            const prods = allProds.filter(p => p.status === 'active' && (AppState.selectedCategory === 'all' || p.category == AppState.selectedCategory));
-            document.getElementById('posProductGrid').innerHTML = prods.map(p =>
-                `<div class="product-card" onclick="addToCart(${p.id})">
-                    <div class="name">${escapeHtml(p.name)}</div>
-                    <div class="price">${p.price.toFixed(2)}</div>
-                </div>`
-            ).join('');
+            try {
+                await DBInstance.waitReady();
+                let prods = await DBInstance.getAll('products') || [];
+                prods = prods.filter(p => p.status === 'active' && (AppState.selectedCategory === 'all' || p.category == AppState.selectedCategory));
+                const grid = document.getElementById('posProductGrid');
+                if (!prods || prods.length === 0) {
+                    grid.innerHTML = '<div style="text-align:center;color:#999;padding:40px 0;">لا توجد منتجات نشطة في هذا التصنيف</div>';
+                    return;
+                }
+                grid.innerHTML = prods.map(p =>
+                    '<div class="product-card" onclick="addToCart(' + p.id + ')">' +
+                    '<div class="name">' + escapeHtml(p.name) + '</div>' +
+                    '<div class="price">' + (p.price || 0).toFixed(2) + '</div>' +
+                    '</div>'
+                ).join('');
+            } catch (e) {
+                console.error(e);
+                document.getElementById('posProductGrid').innerHTML = '<div style="text-align:center;color:red;">خطأ في تحميل المنتجات</div>';
+            }
         }
 
         async function addToCart(id) {
-            const p = await DBInstance.get('products', id);
-            if (!p) return;
-            const ex = AppState.cart.find(c => c.productId === id);
-            if (ex) ex.quantity++;
-            else AppState.cart.push({ productId: p.id, name: p.name, price: p.price, quantity: 1 });
-            updateCartDisplay();
+            try {
+                await DBInstance.waitReady();
+                const p = await DBInstance.get('products', id);
+                if (!p) return;
+                const ex = AppState.cart.find(c => c.productId === id);
+                if (ex) {
+                    ex.quantity = (ex.quantity || 0) + 1;
+                } else {
+                    AppState.cart.push({ productId: p.id, name: p.name || 'منتج', price: p.price || 0, quantity: 1 });
+                }
+                updateCartDisplay();
+            } catch (e) {
+                console.error(e);
+                DBInstance.showToast('خطأ في إضافة المنتج: ' + e.message, 'error');
+            }
         }
 
         function updateCartDisplay() {
             const c = document.getElementById('posCartItems');
-            if (AppState.cart.length === 0) {
-                c.innerHTML = '<div style="text-align:center;color:#999;padding:40px 0;">🛒 السلة فارغة</div>';
+            if (!AppState.cart || AppState.cart.length === 0) {
+                c.innerHTML = '<div style="text-align:center;color:#999;padding:40px 0;">🛒 السلة فارغة<br><span style="font-size:13px;">أضف منتجات من اليمين</span></div>';
                 document.getElementById('posItemCount').textContent = '0';
                 document.getElementById('posOrderBadge').style.display = 'none';
             } else {
                 c.innerHTML = AppState.cart.map((item, i) =>
-                    `<div class="cart-item">
-                        <div class="item-info">
-                            <div class="item-name">${escapeHtml(item.name)}</div>
-                            <div class="item-detail">${item.price} × ${item.quantity}</div>
-                        </div>
-                        <div class="item-actions">
-                            <button onclick="updateQty(${i},-1)">-</button>
-                            <span>${item.quantity}</span>
-                            <button onclick="updateQty(${i},1)">+</button>
-                            <button class="danger" onclick="AppState.cart.splice(${i},1);updateCartDisplay()">✕</button>
-                        </div>
-                        <div class="item-price">${(item.price * item.quantity).toFixed(2)}</div>
-                    </div>`
+                    '<div class="cart-item">' +
+                    '<div class="item-info">' +
+                    '<div class="item-name">' + escapeHtml(item.name) + '</div>' +
+                    '<div class="item-detail">' + (item.price || 0).toFixed(2) + ' × ' + (item.quantity || 0) + '</div>' +
+                    '</div>' +
+                    '<div class="item-actions">' +
+                    '<button onclick="updateQty(' + i + ',-1)">-</button>' +
+                    '<span>' + (item.quantity || 0) + '</span>' +
+                    '<button onclick="updateQty(' + i + ',1)">+</button>' +
+                    '<button class="danger" onclick="AppState.cart.splice(' + i + ',1);updateCartDisplay()">✕</button>' +
+                    '</div>' +
+                    '<div class="item-price">' + ((item.price || 0) * (item.quantity || 0)).toFixed(2) + '</div>' +
+                    '</div>'
                 ).join('');
-                const cnt = AppState.cart.reduce((s, i) => s + i.quantity, 0);
+                const cnt = AppState.cart.reduce((s, i) => s + (i.quantity || 0), 0);
                 document.getElementById('posItemCount').textContent = cnt;
                 document.getElementById('posOrderBadge').style.display = 'block';
                 document.getElementById('posOrderBadge').textContent = cnt;
             }
 
-            const sub = AppState.cart.reduce((s, i) => s + (i.price * i.quantity), 0);
-            const disc = sub * (AppState.cartDiscount / 100);
+            const sub = AppState.cart.reduce((s, i) => s + ((i.price || 0) * (i.quantity || 0)), 0);
+            const disc = sub * ((AppState.cartDiscount || 0) / 100);
             const taxableAmount = Math.max(0, sub - disc);
 
-            const taxEnabled = AppState.settings.taxEnabled || false;
+            const taxEnabled = AppState.settings && AppState.settings.taxEnabled;
             const taxPercent = taxEnabled ? (AppState.settings.taxPercent || 0) : 0;
             const taxAmount = taxableAmount * (taxPercent / 100);
             const grandTotal = taxableAmount + taxAmount;
 
             document.getElementById('posSubtotal').textContent = sub.toFixed(2);
-            document.getElementById('posDiscountPercent').textContent = AppState.cartDiscount;
+            document.getElementById('posDiscountPercent').textContent = AppState.cartDiscount || 0;
             document.getElementById('posDiscountAmount').textContent = disc.toFixed(2);
             document.getElementById('posTaxPercent').textContent = taxPercent;
             document.getElementById('posTaxAmount').textContent = taxAmount.toFixed(2);
             document.getElementById('posGrandTotal').textContent = grandTotal.toFixed(2);
 
-            document.getElementById('posOrderNumber').textContent = 'ORD-' + String(AppState.orderNumber).padStart(6, '0');
+            const orderNum = 'ORD-' + String(AppState.orderNumber || 1).padStart(6, '0');
+            document.getElementById('posOrderNumber').textContent = orderNum;
         }
 
         function updateQty(i, d) {
-            AppState.cart[i].quantity += d;
+            if (!AppState.cart[i]) return;
+            AppState.cart[i].quantity = (AppState.cart[i].quantity || 0) + d;
             if (AppState.cart[i].quantity <= 0) AppState.cart.splice(i, 1);
             updateCartDisplay();
         }
 
         function clearCart() {
-            if (confirm('تفريغ السلة؟')) {
-                AppState.cart = [];
-                AppState.cartDiscount = 0;
-                updateCartDisplay();
-            }
+            if (!confirm('تفريغ السلة؟')) return;
+            AppState.cart = [];
+            AppState.cartDiscount = 0;
+            updateCartDisplay();
         }
 
         function applyDiscount() {
-            const d = prompt('نسبة الخصم %', AppState.cartDiscount);
+            const d = prompt('نسبة الخصم %', AppState.cartDiscount || 0);
             if (d !== null && d.trim() !== '' && !isNaN(d)) {
-                AppState.cartDiscount = parseFloat(d);
+                AppState.cartDiscount = Math.max(0, parseFloat(d));
                 updateCartDisplay();
             }
         }
 
         function showPaymentModal() {
-            if (AppState.cart.length === 0) {
+            if (!AppState.cart || AppState.cart.length === 0) {
                 DBInstance.showToast('السلة فارغة', 'warning');
                 return;
             }
@@ -1972,7 +2513,9 @@
 
         function selectPayment(m) {
             AppState.selectedPayment = m;
-            document.querySelectorAll('#paymentMethods button').forEach(b => b.classList.toggle('selected', b.dataset.method === m));
+            document.querySelectorAll('#paymentMethods button').forEach(b => {
+                b.classList.toggle('selected', b.dataset.method === m);
+            });
             calcChange();
         }
 
@@ -1985,70 +2528,133 @@
         }
 
         async function completePayment() {
-            const grand = parseFloat(document.getElementById('posGrandTotal').textContent);
-            const paid = parseFloat(document.getElementById('paymentAmount').value);
+            // Prevent double click
+            if (AppState.isProcessingPayment) {
+                DBInstance.showToast('جاري معالجة الطلب...', 'info');
+                return;
+            }
+
+            const grand = parseFloat(document.getElementById('posGrandTotal').textContent) || 0;
+            const paid = parseFloat(document.getElementById('paymentAmount').value) || 0;
+
             if (paid < grand) {
                 DBInstance.showToast('المبلغ المدفوع أقل من الفاتورة', 'error');
                 return;
             }
 
+            if (!AppState.cart || AppState.cart.length === 0) {
+                DBInstance.showToast('السلة فارغة', 'warning');
+                return;
+            }
+
+            AppState.isProcessingPayment = true;
+            const paymentModal = document.getElementById('paymentModal');
+
             try {
-                const recipes = await DBInstance.getAll('recipeItems');
-                const invItems = await DBInstance.getAll('inventoryItems');
+                await DBInstance.waitReady();
+
+                // Check inventory
+                const recipes = await DBInstance.getAll('recipeItems') || [];
+                const invItems = await DBInstance.getAll('inventoryItems') || [];
                 const required = {};
 
-                AppState.cart.forEach(c => {
+                for (const c of AppState.cart) {
                     const myR = recipes.filter(r => r.productId === c.productId);
                     myR.forEach(r => {
-                        required[r.inventoryItemId] = (required[r.inventoryItemId] || 0) + (r.quantity * c.quantity);
+                        const invId = r.inventoryItemId;
+                        required[invId] = (required[invId] || 0) + ((r.quantity || 0) * (c.quantity || 0));
                     });
-                });
+                }
 
-                for (const id of Object.keys(required)) {
-                    const inv = invItems.find(i => i.id == id);
-                    if (!inv || inv.quantity < required[id]) {
-                        DBInstance.showToast(`مخزون الصنف المرتبط (${inv ? escapeHtml(inv.name) : 'مجهول'}) غير كافِ. المطلوب: ${required[id]}`, 'error');
+                for (const idStr of Object.keys(required)) {
+                    const id = parseInt(idStr);
+                    const inv = invItems.find(i => i.id === id);
+                    if (!inv) {
+                        DBInstance.showToast('المنتج مرتبط بصنف مخزني غير موجود', 'error');
+                        AppState.isProcessingPayment = false;
+                        return;
+                    }
+                    if ((inv.quantity || 0) < required[idStr]) {
+                        DBInstance.showToast('مخزون الصنف (' + escapeHtml(inv.name) + ') غير كافِ. المطلوب: ' + required[idStr] + '، المتوفر: ' + inv.quantity, 'error');
+                        AppState.isProcessingPayment = false;
                         return;
                     }
                 }
 
+                // Deduct inventory and calculate cost
                 let totalCost = 0;
-                for (const id of Object.keys(required)) {
-                    const inv = invItems.find(i => i.id == id);
-                    inv.quantity -= required[id];
-                    totalCost += required[id] * inv.unitCost;
-                    await DBInstance.put('inventoryItems', inv);
+                for (const idStr of Object.keys(required)) {
+                    const id = parseInt(idStr);
+                    const inv = invItems.find(i => i.id === id);
+                    if (inv) {
+                        const qtyToDeduct = required[idStr];
+                        inv.quantity = (inv.quantity || 0) - qtyToDeduct;
+                        totalCost += qtyToDeduct * (inv.unitCost || 0);
+                        await DBInstance.put('inventoryItems', inv);
+
+                        // Log transaction
+                        await DBInstance.add('inventoryTransactions', {
+                            itemId: inv.id,
+                            itemName: inv.name,
+                            type: 'sale',
+                            quantity: qtyToDeduct,
+                            unitCost: inv.unitCost || 0,
+                            totalCost: qtyToDeduct * (inv.unitCost || 0),
+                            date: new Date().toISOString().split('T')[0],
+                            note: 'فاتورة بيع #' + document.getElementById('posOrderNumber').textContent
+                        });
+                    }
                 }
 
+                // Create order
                 const now = new Date();
                 const order = {
                     orderNumber: document.getElementById('posOrderNumber').textContent,
                     date: now.toISOString().split('T')[0],
                     time: now.toTimeString().split(' ')[0],
-                    subtotal: parseFloat(document.getElementById('posSubtotal').textContent),
-                    discountPercent: AppState.cartDiscount,
-                    taxAmount: parseFloat(document.getElementById('posTaxAmount').textContent),
+                    subtotal: parseFloat(document.getElementById('posSubtotal').textContent) || 0,
+                    discountPercent: AppState.cartDiscount || 0,
+                    taxAmount: parseFloat(document.getElementById('posTaxAmount').textContent) || 0,
                     grandTotal: grand,
                     totalCost: totalCost,
                     profit: grand - totalCost,
-                    paymentMethod: AppState.selectedPayment,
+                    paymentMethod: AppState.selectedPayment || 'cash',
                     status: 'paid',
-                    items: [...AppState.cart]
+                    items: JSON.parse(JSON.stringify(AppState.cart))
                 };
 
                 await DBInstance.add('orders', order);
+
+                // Update order number
                 AppState.orderNumber++;
+
+                // Clear cart
                 AppState.cart = [];
                 AppState.cartDiscount = 0;
                 updateCartDisplay();
-                closePaymentModal();
+                paymentModal.classList.remove('active');
+                AppState.isProcessingPayment = false;
+
+                // Broadcast
                 syncChannel.postMessage({ type: 'NEW_ORDER', data: order });
+
                 DBInstance.showToast('تم الدفع بنجاح', 'success');
                 printReceipt(order);
-                if (document.getElementById('page-dashboard').classList.contains('active')) await renderDashboard();
+
+                if (document.getElementById('page-dashboard').classList.contains('active')) {
+                    await renderDashboard();
+                }
+                if (document.getElementById('page-inventory').classList.contains('active')) {
+                    await renderInventory();
+                }
+                if (document.getElementById('page-orders').classList.contains('active')) {
+                    await renderOrders();
+                }
+
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في إتمام الطلب', 'error');
+                AppState.isProcessingPayment = false;
+                DBInstance.showToast('خطأ في إتمام الطلب: ' + e.message, 'error');
             }
         }
 
@@ -2056,126 +2662,308 @@
         // ORDERS & REPORTS
         // ================================================================
         async function renderOrders() {
-            const orders = await DBInstance.getAll('orders');
-            orders.sort((a, b) => b.id - a.id);
-            document.getElementById('ordersTableBody').innerHTML = orders.map(o =>
-                `<tr>
-                    <td><strong>${escapeHtml(o.orderNumber)}</strong></td>
-                    <td>${escapeHtml(o.date)}</td>
-                    <td>${escapeHtml(o.time)}</td>
-                    <td>${o.grandTotal.toFixed(2)}</td>
-                    <td>${o.paymentMethod === 'cash' ? 'كاش' : o.paymentMethod === 'visa' ? 'فيزا' : 'محفظة'}</td>
-                    <td><span class="status-badge ${o.status === 'paid' ? 'paid' : 'cancelled'}">${o.status === 'paid' ? 'مدفوع' : 'ملغي'}</span></td>
-                    <td><button class="btn btn-primary btn-sm" onclick="reprintOrder(${o.id})">🖨️ طباعة</button></td>
-                </tr>`
-            ).join('') || '<tr><td colspan="7" style="text-align:center;">لا فواتير</td></tr>';
+            try {
+                await DBInstance.waitReady();
+                const searchTerm = (document.getElementById('orderSearch').value || '').toLowerCase().trim();
+                const dateFrom = document.getElementById('orderDateFrom').value;
+                const dateTo = document.getElementById('orderDateTo').value;
+                const paymentFilter = document.getElementById('orderPaymentFilter').value;
+
+                let orders = await DBInstance.getAll('orders') || [];
+                orders.sort((a, b) => (b.id || 0) - (a.id || 0));
+
+                // Apply filters
+                if (searchTerm) {
+                    orders = orders.filter(o => (o.orderNumber || '').toLowerCase().includes(searchTerm));
+                }
+                if (dateFrom) {
+                    orders = orders.filter(o => (o.date || '') >= dateFrom);
+                }
+                if (dateTo) {
+                    orders = orders.filter(o => (o.date || '') <= dateTo);
+                }
+                if (paymentFilter !== 'all') {
+                    orders = orders.filter(o => o.paymentMethod === paymentFilter);
+                }
+
+                const tbody = document.getElementById('ordersTableBody');
+                if (!orders || orders.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;">لا فواتير</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = orders.map(o =>
+                    '<tr>' +
+                    '<td><strong>' + escapeHtml(o.orderNumber || '') + '</strong></td>' +
+                    '<td>' + escapeHtml(o.date || '-') + '</td>' +
+                    '<td>' + escapeHtml(o.time || '-') + '</td>' +
+                    '<td>' + (o.grandTotal || 0).toFixed(2) + '</td>' +
+                    '<td>' + (o.paymentMethod === 'cash' ? 'كاش' : o.paymentMethod === 'visa' ? 'فيزا' : o.paymentMethod === 'wallet' ? 'محفظة' : escapeHtml(o.paymentMethod || '-')) + '</td>' +
+                    '<td><span class="status-badge ' + (o.status === 'paid' ? 'paid' : 'cancelled') + '">' + (o.status === 'paid' ? 'مدفوع' : 'ملغي') + '</span></td>' +
+                    '<td><button class="btn btn-primary btn-sm" onclick="reprintOrder(' + o.id + ')">🖨️ طباعة</button></td>' +
+                    '</tr>'
+                ).join('');
+            } catch (e) {
+                console.error(e);
+                document.getElementById('ordersTableBody').innerHTML = '<tr><td colspan="7" style="text-align:center;color:red;">خطأ في تحميل الفواتير</td></tr>';
+            }
         }
 
         async function reprintOrder(id) {
-            const o = await DBInstance.get('orders', id);
-            if (o) printReceipt(o);
+            try {
+                await DBInstance.waitReady();
+                const o = await DBInstance.get('orders', id);
+                if (o) printReceipt(o);
+                else DBInstance.showToast('الفاتورة غير موجودة', 'error');
+            } catch (e) {
+                console.error(e);
+                DBInstance.showToast('خطأ في طباعة الفاتورة: ' + e.message, 'error');
+            }
         }
 
         function printReceipt(order) {
-            const s = AppState.settings;
-            let html = `<html><head><style>
-                body{font-family:monospace;direction:rtl;text-align:center;padding:10px;font-size:14px;}
-                @media print{button{display:none;}}
-                table{width:100%;border-top:1px dashed #000;border-bottom:1px dashed #000;margin:10px 0;}
-                .total{font-weight:bold;font-size:16px;}
-            </style></head><body>`;
-            html += `<h2>${escapeHtml(s.restaurantName)}</h2>
-                <div>${escapeHtml(s.address)}</div>
-                <div>${escapeHtml(s.phone)}</div>
-                <hr style="border:1px dashed #000;">
-                <div style="text-align:right;">فاتورة: ${escapeHtml(order.orderNumber)}<br>تاريخ: ${escapeHtml(order.date)} ${escapeHtml(order.time)}</div>
-                <table>
-                    <tr><th style="text-align:right;">الصنف</th><th>الكمية</th><th style="text-align:left;">السعر</th></tr>`;
-            order.items.forEach(i => {
-                html += `<tr><td style="text-align:right;">${escapeHtml(i.name)}</td><td>${i.quantity}</td><td style="text-align:left;">${(i.price * i.quantity).toFixed(2)}</td></tr>`;
-            });
-            html += `</table>`;
-            if (order.taxAmount && order.taxAmount > 0) {
-                html += `<div style="text-align:left;font-size:13px;">الضريبة: ${order.taxAmount.toFixed(2)}</div>`;
+            try {
+                const s = AppState.settings || {};
+                const restName = s.restaurantName || 'متجري';
+                const address = s.address || '';
+                const phone = s.phone || '';
+                const footerMsg = s.footerMessage || s.receiptFooter || 'شكرًا لزيارتكم';
+                const receiptHeader = s.receiptHeader || 'شكرًا لكم';
+                const width = s.receiptWidth || 80;
+
+                let html = '<html><head><style>';
+                html += 'body{font-family:monospace;direction:rtl;text-align:center;padding:10px;font-size:14px;max-width:' + width + 'mm;margin:0 auto;}';
+                html += '@media print{button{display:none;}}';
+                html += 'table{width:100%;border-top:1px dashed #000;border-bottom:1px dashed #000;margin:10px 0;}';
+                html += '.total{font-weight:bold;font-size:16px;}';
+                html += '.header{font-weight:bold;font-size:18px;}';
+                html += '.footer{margin-top:10px;font-size:12px;color:#555;}';
+                html += '</style></head><body>';
+
+                html += '<div class="header">' + escapeHtml(restName) + '</div>';
+                if (address) html += '<div>' + escapeHtml(address) + '</div>';
+                if (phone) html += '<div>' + escapeHtml(phone) + '</div>';
+                html += '<div>' + escapeHtml(receiptHeader) + '</div>';
+                html += '<hr style="border:1px dashed #000;">';
+                html += '<div style="text-align:right;">الفاتورة: ' + escapeHtml(order.orderNumber || '') + '<br>التاريخ: ' + escapeHtml(order.date || '') + ' ' + escapeHtml(order.time || '') + '</div>';
+                html += '<table>';
+                html += '<tr><th style="text-align:right;">الصنف</th><th>الكمية</th><th style="text-align:left;">السعر</th></tr>';
+
+                const items = order.items || [];
+                let subtotal = 0;
+                for (const i of items) {
+                    const qty = i.quantity || 0;
+                    const price = i.price || 0;
+                    const lineTotal = qty * price;
+                    subtotal += lineTotal;
+                    html += '<tr><td style="text-align:right;">' + escapeHtml(i.name || '') + '</td><td>' + qty + '</td><td style="text-align:left;">' + lineTotal.toFixed(2) + '</td></tr>';
+                }
+
+                html += '</table>';
+                const discountAmt = subtotal * ((order.discountPercent || 0) / 100);
+                const taxAmt = order.taxAmount || 0;
+                const grand = order.grandTotal || subtotal - discountAmt + taxAmt;
+
+                html += '<div style="text-align:left;font-size:13px;">المجموع: ' + subtotal.toFixed(2) + '</div>';
+                if (discountAmt > 0) {
+                    html += '<div style="text-align:left;font-size:13px;">الخصم (' + (order.discountPercent || 0) + '%): -' + discountAmt.toFixed(2) + '</div>';
+                }
+                if (taxAmt > 0) {
+                    html += '<div style="text-align:left;font-size:13px;">الضريبة: ' + taxAmt.toFixed(2) + '</div>';
+                }
+                html += '<div style="text-align:left;font-weight:bold;font-size:16px;">الإجمالي: ' + grand.toFixed(2) + '</div>';
+
+                html += '<hr style="border:1px dashed #000;">';
+                html += '<div class="footer">' + escapeHtml(footerMsg) + '</div>';
+                html += '<button onclick="window.print()" style="padding:10px;margin-top:20px;">طباعة الفاتورة</button>';
+                html += '</body></html>';
+
+                const win = window.open('', '_blank', 'width=400,height=600');
+                if (win) {
+                    win.document.write(html);
+                    win.document.close();
+                } else {
+                    // Fallback: print directly
+                    const printWin = window.open('', '_blank', 'width=400,height=600');
+                    if (printWin) {
+                        printWin.document.write(html);
+                        printWin.document.close();
+                    } else {
+                        DBInstance.showToast('الرجاء السماح للنوافذ المنبثقة', 'warning');
+                    }
+                }
+            } catch (e) {
+                console.error(e);
+                DBInstance.showToast('خطأ في الطباعة: ' + e.message, 'error');
             }
-            html += `<div style="text-align:left;font-weight:bold;font-size:16px;">الإجمالي: ${order.grandTotal.toFixed(2)}</div>
-                <hr style="border:1px dashed #000;">
-                <p>${escapeHtml(s.footerMessage)}</p>
-                <button onclick="window.print()" style="padding:10px;margin-top:20px;">طباعة الفاتورة</button>
-            </body></html>`;
-            const win = window.open('', '_blank', 'width=400,height=600');
-            win.document.write(html);
-            win.document.close();
         }
 
         async function generateReport(t) {
-            const p = document.getElementById('reportContent');
-            document.getElementById('reportTitle').textContent =
-                t === 'sales' ? 'المبيعات' :
-                t === 'profit' ? 'الأرباح' :
-                t === 'products' ? 'حركة المنتجات' : 'النواقص والجرد';
+            try {
+                await DBInstance.waitReady();
+                const p = document.getElementById('reportContent');
+                document.getElementById('reportTitle').textContent =
+                    t === 'sales' ? 'تقرير المبيعات' :
+                    t === 'profit' ? 'تقرير الأرباح' :
+                    t === 'products' ? 'حركة المنتجات' : 'تقرير الجرد والمخزون';
 
-            const orders = (await DBInstance.getAll('orders')).filter(o => o.status === 'paid');
-            let html = '';
-            if (t === 'sales') {
-                const tot = orders.reduce((s, o) => s + o.grandTotal, 0);
-                html = `<h2 style="color:#0066cc;">إجمالي المبيعات: ${tot.toFixed(2)}</h2>`;
-            } else if (t === 'profit') {
-                const prof = orders.reduce((s, o) => s + (o.profit || 0), 0);
-                html = `<h2 style="color:#00aa66;">إجمالي الأرباح: ${prof.toFixed(2)}</h2>`;
-            } else if (t === 'inventory') {
-                const inv = await DBInstance.getAll('inventoryItems');
-                html = `<table style="width:100%;">
-                    <tr><th style="text-align:right;">الصنف</th><th style="text-align:right;">الرصيد الفعلي</th></tr>
-                    ${inv.map(i => `<tr><td>${escapeHtml(i.name)}</td><td style="color:${i.quantity <= i.minStock ? 'red' : 'green'};font-weight:bold;">${i.quantity}</td></tr>`).join('')}
-                </table>`;
-            } else if (t === 'products') {
-                const pSales = {};
-                orders.forEach(o => o.items.forEach(i => pSales[i.name] = (pSales[i.name] || 0) + i.quantity));
-                html = `<table style="width:100%;">
-                    <tr><th style="text-align:right;">المنتج</th><th style="text-align:right;">الكمية المباعة</th></tr>
-                    ${Object.entries(pSales).sort((a, b) => b[1] - a[1]).map(x => `<tr><td>${escapeHtml(x[0])}</td><td style="font-weight:bold;">${x[1]}</td></tr>`).join('')}
-                </table>`;
+                const orders = await DBInstance.getAll('orders') || [];
+                const paidOrders = orders.filter(o => o.status === 'paid');
+
+                let html = '';
+                if (t === 'sales') {
+                    const tot = paidOrders.reduce((s, o) => s + (o.grandTotal || 0), 0);
+                    const count = paidOrders.length;
+                    html = '<h2 style="color:#0066cc;">إجمالي المبيعات: ' + tot.toFixed(2) + '</h2>' +
+                        '<p>عدد الفواتير: ' + count + '</p>' +
+                        '<p>متوسط الفاتورة: ' + (count > 0 ? (tot / count).toFixed(2) : '0.00') + '</p>';
+                } else if (t === 'profit') {
+                    const prof = paidOrders.reduce((s, o) => s + (o.profit || 0), 0);
+                    const rev = paidOrders.reduce((s, o) => s + (o.grandTotal || 0), 0);
+                    const margin = rev > 0 ? ((prof / rev) * 100) : 0;
+                    html = '<h2 style="color:#00aa66;">إجمالي الأرباح: ' + prof.toFixed(2) + '</h2>' +
+                        '<p>هامش الربح الإجمالي: ' + margin.toFixed(1) + '%</p>';
+                } else if (t === 'inventory') {
+                    const inv = await DBInstance.getAll('inventoryItems') || [];
+                    const totalValue = inv.reduce((s, i) => s + ((i.quantity || 0) * (i.unitCost || 0)), 0);
+                    html = '<h3 style="color:#0066cc;">قيمة المخزون الإجمالية: ' + totalValue.toFixed(2) + '</h3>';
+                    html += '<table style="width:100%;">' +
+                        '<tr><th style="text-align:right;">الصنف</th><th style="text-align:right;">الرصيد</th><th style="text-align:right;">القيمة</th></tr>';
+                    for (const i of inv) {
+                        const qty = i.quantity || 0;
+                        const cost = i.unitCost || 0;
+                        html += '<tr><td>' + escapeHtml(i.name) + '</td><td style="color:' + (qty <= (i.minStock || 0) ? 'red' : 'green') + ';font-weight:bold;">' + qty + '</td><td>' + (qty * cost).toFixed(2) + '</td></tr>';
+                    }
+                    html += '</table>';
+                } else if (t === 'products') {
+                    const pSales = {};
+                    paidOrders.forEach(o => {
+                        const items = o.items || [];
+                        items.forEach(i => {
+                            pSales[i.name] = (pSales[i.name] || 0) + (i.quantity || 0);
+                        });
+                    });
+                    const sorted = Object.entries(pSales).sort((a, b) => b[1] - a[1]);
+                    html = '<table style="width:100%;">' +
+                        '<tr><th style="text-align:right;">المنتج</th><th style="text-align:right;">الكمية المباعة</th></tr>';
+                    for (const [name, qty] of sorted) {
+                        html += '<tr><td>' + escapeHtml(name) + '</td><td style="font-weight:bold;">' + qty + '</td></tr>';
+                    }
+                    html += '</table>';
+                    if (sorted.length === 0) html = '<p>لا توجد مبيعات مسجلة.</p>';
+                }
+                p.innerHTML = html || '<p>لا توجد بيانات.</p>';
+            } catch (e) {
+                console.error(e);
+                document.getElementById('reportContent').innerHTML = '<p style="color:red;">خطأ في تحميل التقرير: ' + escapeHtml(e.message) + '</p>';
             }
-            p.innerHTML = html || '<p>لا توجد بيانات.</p>';
         }
 
         // ================================================================
         // DEMO DATA & CLEAR ALL
         // ================================================================
         async function loadDemoData() {
-            if (confirm('هل أنت متأكد من تحميل بيانات تجريبية (ملابس وعطور)؟')) {
-                await DBInstance.loadDemoData();
-                await renderDashboard();
-                await renderProducts();
-                await renderItemCodes();
-                await renderInventory();
-                await renderCategories();
-                if (document.getElementById('page-pos').classList.contains('active')) await renderPOS();
-                DBInstance.showToast('تم تحديث الصفحات بالبيانات التجريبية', 'success');
-            }
+            if (!confirm('هل أنت متأكد من تحميل بيانات تجريبية (ملابس وعطور)؟')) return;
+            await DBInstance.loadDemoData();
+            await renderDashboard();
+            await renderProducts();
+            await renderItemCodes();
+            await renderInventory();
+            await renderCategories();
+            await updateCategoryFilters();
+            if (document.getElementById('page-pos').classList.contains('active')) await renderPOS();
+            DBInstance.showToast('تم تحديث الصفحات بالبيانات التجريبية', 'success');
         }
 
         async function clearAllData() {
             if (!confirm('تحذير: سيتم حذف جميع الفواتير والمخزون نهائياً. تأكيد؟')) return;
+            if (!confirm('هل أنت متأكد تماماً؟ هذا الإجراء لا يمكن التراجع عنه.')) return;
+
             try {
-                // clear all stores
-                const storeNames = ['users', 'settings', 'categories', 'inventoryItems', 'purchases', 'inventoryTransactions', 'products', 'recipeItems', 'orders', 'orderItems', 'auditLogs'];
-                for (let name of storeNames) {
-                    const items = await DBInstance.getAll(name);
-                    for (let item of items) {
-                        await DBInstance.delete(name, item.id);
+                await DBInstance.waitReady();
+
+                // Reset using LocalStorageEngine if that's what we're using
+                if (DBInstance.engine instanceof LocalStorageEngine) {
+                    DBInstance.engine.resetAll();
+                } else {
+                    // IndexedDB: delete all records from all stores
+                    const storeNames = ['users', 'settings', 'categories', 'inventoryItems', 'purchases', 'inventoryTransactions', 'products', 'recipeItems', 'orders', 'orderItems', 'auditLogs'];
+                    for (let name of storeNames) {
+                        const items = await DBInstance.getAll(name) || [];
+                        for (let item of items) {
+                            await DBInstance.delete(name, item.id);
+                        }
                     }
                 }
-                // reinitialize default data
+
+                // Reinitialize default data
                 await DBInstance.ensureDefaultData();
+
+                // Reload settings
+                const set = await DBInstance.get('settings', 1);
+                if (set) AppState.settings = set;
+
+                // Reset order number
+                const orders = await DBInstance.getAll('orders') || [];
+                if (orders && orders.length > 0) {
+                    let maxNum = 0;
+                    for (let o of orders) {
+                        const numStr = String(o.orderNumber || '').replace('ORD-', '');
+                        const num = parseInt(numStr, 10);
+                        if (!isNaN(num) && num > maxNum) maxNum = num;
+                    }
+                    if (maxNum > 0) AppState.orderNumber = maxNum + 1;
+                } else {
+                    AppState.orderNumber = 1;
+                }
+
+                // Reset cart
+                AppState.cart = [];
+                AppState.cartDiscount = 0;
+                updateCartDisplay();
+
+                // Refresh all views
+                await renderDashboard();
+                await renderProducts();
+                await renderItemCodes();
+                await renderInventory();
+                await renderPurchases();
+                await renderOrders();
+                await renderCategories();
+                await updateCategoryFilters();
+                if (document.getElementById('page-pos').classList.contains('active')) await renderPOS();
+
                 DBInstance.showToast('تم مسح جميع البيانات وإعادة التهيئة', 'success');
-                setTimeout(() => window.location.reload(), 1000);
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('فشل مسح البيانات', 'error');
+                DBInstance.showToast('فشل مسح البيانات: ' + e.message, 'error');
             }
         }
+
+        // ================================================================
+        // INITIAL SETUP - Update category filters on page load
+        // ================================================================
+        // This will be called after login and navigation
+        // Also call it when categories change
+
+        // Override the addCategory and deleteCategory to update filters
+        const origAddCategory = addCategory;
+        addCategory = async function() {
+            await origAddCategory.call(this);
+            await updateCategoryFilters();
+        };
+
+        const origDeleteCategory = deleteCategory;
+        deleteCategory = async function(id) {
+            await origDeleteCategory.call(this, id);
+            await updateCategoryFilters();
+        };
+
+        // Initialize category filters after login
+        document.addEventListener('DOMContentLoaded', function() {
+            // Will be called after login
+        });
+
+        console.log('Store Manager initialized successfully.');
     </script>
 </body>
 </html>
