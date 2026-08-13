@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Store Manager - MinaTech</title>
     <link rel="icon" type="image/png" href="https://raw.githubusercontent.com/Minakhairat/Storeii/a52bd8b0a9fdd697a615f442251e368e885c914b/Storeii.png">
-    <style>  
+    <style>
         * {
             margin: 0;
             padding: 0;
@@ -847,54 +847,67 @@
                 });
             }
 
+            // ============================================================
+            // FIX: ensureDefaultData - now properly awaits hash generation
+            // ============================================================
             async ensureDefaultData() {
-                return new Promise((resolve, reject) => {
+                await this.waitReady(); // ensure db is open
+                return new Promise(async (resolve, reject) => {
                     const tx = this.db.transaction(['users', 'settings', 'categories'], 'readwrite');
                     tx.oncomplete = () => resolve();
                     tx.onerror = (e) => reject(e.target.error);
 
-                    const usersStore = tx.objectStore('users');
-                    (async () => {
+                    try {
+                        const usersStore = tx.objectStore('users');
                         const adminHash = await this.hashPassword('admin123');
                         const cashierHash = await this.hashPassword('cashier123');
-                        const users = [
-                            { id: 1, username: 'admin', password: adminHash, role: 'admin', name: 'المدير' },
-                            { id: 2, username: 'cashier', password: cashierHash, role: 'cashier', name: 'الكاشير' }
-                        ];
-                        users.forEach(u => {
-                            usersStore.get(u.id).onsuccess = (e) => {
-                                if (!e.target.result) usersStore.add(u);
-                            };
-                        });
-                    })();
 
-                    const setReq = tx.objectStore('settings').get(1);
-                    setReq.onsuccess = (e) => {
-                        if (!e.target.result) {
-                            tx.objectStore('settings').add({
-                                id: 1,
-                                restaurantName: 'متجري',
-                                phone: '0123456789',
-                                address: 'القاهرة، مصر',
-                                taxEnabled: false,
-                                taxPercent: 14,
-                                footerMessage: 'شكرًا لزيارتكم',
-                                receiptWidth: 80,
-                                receiptHeader: 'متجري - شكرًا لكم',
-                                receiptFooter: 'نتمنى لكم يومًا سعيدًا',
-                                profitMargin: 40,
-                                logo: null
-                            });
-                        }
-                    };
+                        // Check if users already exist
+                        const adminReq = usersStore.get(1);
+                        adminReq.onsuccess = (e) => {
+                            if (!e.target.result) {
+                                usersStore.add({ id: 1, username: 'admin', password: adminHash, role: 'admin', name: 'المدير' });
+                            }
+                        };
+                        const cashierReq = usersStore.get(2);
+                        cashierReq.onsuccess = (e) => {
+                            if (!e.target.result) {
+                                usersStore.add({ id: 2, username: 'cashier', password: cashierHash, role: 'cashier', name: 'الكاشير' });
+                            }
+                        };
 
-                    const catReq = tx.objectStore('categories').count();
-                    catReq.onsuccess = (e) => {
-                        if (e.target.result === 0) {
-                            const cats = ['ملابس', 'عطور', 'إكسسوارات', 'أحذية', 'حقائب', 'أخرى'];
-                            cats.forEach(name => tx.objectStore('categories').add({ name }));
-                        }
-                    };
+                        // Settings
+                        const setReq = tx.objectStore('settings').get(1);
+                        setReq.onsuccess = (e) => {
+                            if (!e.target.result) {
+                                tx.objectStore('settings').add({
+                                    id: 1,
+                                    restaurantName: 'متجري',
+                                    phone: '0123456789',
+                                    address: 'القاهرة، مصر',
+                                    taxEnabled: false,
+                                    taxPercent: 14,
+                                    footerMessage: 'شكرًا لزيارتكم',
+                                    receiptWidth: 80,
+                                    receiptHeader: 'متجري - شكرًا لكم',
+                                    receiptFooter: 'نتمنى لكم يومًا سعيدًا',
+                                    profitMargin: 40,
+                                    logo: null
+                                });
+                            }
+                        };
+
+                        // Categories
+                        const catReq = tx.objectStore('categories').count();
+                        catReq.onsuccess = (e) => {
+                            if (e.target.result === 0) {
+                                const cats = ['ملابس', 'عطور', 'إكسسوارات', 'أحذية', 'حقائب', 'أخرى'];
+                                cats.forEach(name => tx.objectStore('categories').add({ name }));
+                            }
+                        };
+                    } catch (err) {
+                        reject(err);
+                    }
                 });
             }
 
@@ -1024,6 +1037,11 @@
             try {
                 await DBInstance.waitReady();
                 const users = await DBInstance.getAll('users');
+                if (!users || users.length === 0) {
+                    err.textContent = 'لا يوجد مستخدمون. تأكد من تهيئة قاعدة البيانات.';
+                    err.style.display = 'block';
+                    return;
+                }
                 const hashed = await DBInstance.hashPassword(password);
                 const matchedUser = users.find(u => u.password === hashed);
                 if (matchedUser) {
@@ -1233,7 +1251,6 @@
             input.value = '';
             DBInstance.showToast('تمت إضافة التصنيف', 'success');
             await renderCategories();
-            // تحديث الفلاتر في المنتجات والمخزون وPOS عند الحاجة
             if (document.getElementById('page-products').classList.contains('active')) await renderProducts();
             if (document.getElementById('page-itemcodes').classList.contains('active')) await renderItemCodes();
             if (document.getElementById('page-inventory').classList.contains('active')) await renderInventory();
@@ -1242,7 +1259,6 @@
 
         async function deleteCategory(id) {
             if (!confirm('هل أنت متأكد من حذف هذا التصنيف؟')) return;
-            // التحقق من وجود منتجات أو أصناف مرتبطة بهذا التصنيف
             const products = await DBInstance.getAll('products');
             const items = await DBInstance.getAll('inventoryItems');
             const usedInProducts = products.some(p => p.category === id);
@@ -2010,12 +2026,11 @@
         }
 
         // ================================================================
-        // DEMO DATA & CLEAR ALL (الإصلاحات)
+        // DEMO DATA & CLEAR ALL (مع الإصلاحات)
         // ================================================================
         async function loadDemoData() {
             if (confirm('هل أنت متأكد من تحميل بيانات تجريبية (ملابس وعطور)؟')) {
                 await DBInstance.loadDemoData();
-                // تحديث جميع الصفحات المعنية
                 await renderDashboard();
                 await renderProducts();
                 await renderItemCodes();
@@ -2029,7 +2044,6 @@
         async function clearAllData() {
             if (!confirm('تحذير: سيتم حذف جميع الفواتير والمخزون نهائياً. تأكيد؟')) return;
             try {
-                // حذف قاعدة البيانات باستخدام onsuccess
                 const deleteRequest = indexedDB.deleteDatabase('StoreManagerDB_V1');
                 deleteRequest.onsuccess = () => {
                     DBInstance.showToast('تم حذف جميع البيانات، سيتم إعادة تشغيل التطبيق.', 'info');
