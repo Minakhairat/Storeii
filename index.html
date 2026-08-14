@@ -476,6 +476,13 @@
             gap: 6px;
             flex-wrap: wrap;
         }
+        .btn-info {
+            background: #17a2b8;
+            color: white;
+        }
+        .btn-info:hover {
+            background: #138496;
+        }
 
         .pos-layout {
             display: grid;
@@ -690,6 +697,12 @@
             min-height: 60px;
         }
         .form-actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 16px;
+            justify-content: flex-end;
+        }
+        .modal-actions {
             display: flex;
             gap: 10px;
             margin-top: 16px;
@@ -1513,7 +1526,7 @@
     <!-- ================================================================ -->
     <script>
         // ================================================================
-        // ESCAPE HTML
+        // ESCAPE HTML (XSS protection)
         // ================================================================
         function escapeHtml(text) {
             if (text === null || text === undefined) return '';
@@ -1522,11 +1535,26 @@
         }
 
         // ================================================================
-        // APP STATE & SYNC
+        // TOAST SYSTEM (global)
         // ================================================================
-        let DBInstance = null;
-        const syncChannel = new BroadcastChannel('storemanager_sync_channel');
+        function showToast(message, type) {
+            type = type || 'info';
+            const container = document.getElementById('toastContainer');
+            if (!container) return;
+            const toast = document.createElement('div');
+            toast.className = 'toast ' + type;
+            toast.textContent = message;
+            container.appendChild(toast);
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                toast.style.transform = 'translateX(100px)';
+                setTimeout(() => toast.remove(), 300);
+            }, 3000);
+        }
 
+        // ================================================================
+        // APP STATE
+        // ================================================================
         let AppState = {
             currentUser: null,
             currentRole: null,
@@ -1541,30 +1569,44 @@
             isProcessingPayment: false
         };
 
-        syncChannel.onmessage = async (event) => {
-            const { type } = event.data;
-            if (type === 'NEW_ORDER' && DBInstance && DBInstance.state === 'ready') {
-                if (document.getElementById('page-dashboard').classList.contains('active')) await renderDashboard();
-                if (document.getElementById('page-orders').classList.contains('active')) await renderOrders();
-                if (document.getElementById('page-inventory').classList.contains('active')) await renderInventory();
+        // ================================================================
+        // BROADCAST CHANNEL (with fallback)
+        // ================================================================
+        let syncChannel = null;
+        try {
+            if (typeof BroadcastChannel !== 'undefined') {
+                syncChannel = new BroadcastChannel('storemanager_sync_channel');
+                syncChannel.onmessage = function(event) {
+                    const { type } = event.data || {};
+                    if (type === 'NEW_ORDER' && DBInstance && DBInstance.state === 'ready') {
+                        refreshCurrentPage();
+                    }
+                };
             }
-        };
+        } catch (_) { /* silently fallback */ }
 
-        function toggleSidebar() {
-            const sidebar = document.getElementById('sidebar');
-            const overlay = document.getElementById('mobileOverlay');
-            sidebar.classList.toggle('open');
-            if (overlay) overlay.classList.toggle('active');
+        function broadcastNewOrder(order) {
+            try {
+                if (syncChannel) {
+                    syncChannel.postMessage({ type: 'NEW_ORDER', data: order });
+                }
+            } catch (_) { /* ignore */ }
         }
 
         // ================================================================
-        // LOCAL STORAGE ENGINE (fallback for IndexedDB)
+        // DATABASE ENGINE: IndexedDB with LocalStorage fallback
         // ================================================================
+
+        // ---- LocalStorage Engine ----
         class LocalStorageEngine {
             constructor() {
                 this.ready = true;
                 this.state = 'ready';
                 this._data = {};
+                this._counters = {};
+                const defaultStores = ['users', 'settings', 'categories', 'inventoryItems', 'purchases',
+                    'inventoryTransactions', 'products', 'recipeItems', 'orders', 'orderItems', 'auditLogs'
+                ];
                 for (let key in localStorage) {
                     if (key.startsWith('store_')) {
                         const storeName = key.replace('store_', '');
@@ -1576,25 +1618,23 @@
                         }
                     }
                 }
-                const defaultStores = ['users', 'settings', 'categories', 'inventoryItems', 'purchases', 'inventoryTransactions',
-                    'products', 'recipeItems', 'orders', 'orderItems', 'auditLogs'
-                ];
                 defaultStores.forEach(name => {
                     if (!this._data[name]) {
                         this._data[name] = [];
                         localStorage.setItem('store_' + name, JSON.stringify([]));
                     }
-                });
-                this._counters = {};
-                for (let name in this._data) {
+                    // fix counters
                     const items = this._data[name];
                     if (items && items.length > 0) {
-                        const maxId = Math.max(...items.map(item => (item.id || 0)));
+                        let maxId = 0;
+                        for (let item of items) {
+                            if (item.id && item.id > maxId) maxId = item.id;
+                        }
                         this._counters[name] = maxId + 1;
                     } else {
                         this._counters[name] = 1;
                     }
-                }
+                });
             }
 
             _saveStore(name) {
@@ -1647,59 +1687,268 @@
                 this._saveStore(storeName);
             }
 
-            async waitReady() {
-                return true;
-            }
+            async waitReady() { return true; }
 
             resetAll() {
                 this._data = {};
                 this._counters = {};
-                const defaultStores = ['users', 'settings', 'categories', 'inventoryItems', 'purchases', 'inventoryTransactions',
-                    'products', 'recipeItems', 'orders', 'orderItems', 'auditLogs'
+                const defaultStores = ['users', 'settings', 'categories', 'inventoryItems', 'purchases',
+                    'inventoryTransactions', 'products', 'recipeItems', 'orders', 'orderItems', 'auditLogs'
                 ];
                 defaultStores.forEach(name => {
                     this._data[name] = [];
                     this._counters[name] = 1;
                     localStorage.setItem('store_' + name, JSON.stringify([]));
                 });
-                this._saveStore('users');
-                this._saveStore('settings');
-                this._saveStore('categories');
-                this._saveStore('inventoryItems');
-                this._saveStore('purchases');
-                this._saveStore('inventoryTransactions');
-                this._saveStore('products');
-                this._saveStore('recipeItems');
-                this._saveStore('orders');
-                this._saveStore('orderItems');
-                this._saveStore('auditLogs');
+            }
+
+            // For backup/restore - get all data
+            getAllData() {
+                const result = {};
+                const defaultStores = ['users', 'settings', 'categories', 'inventoryItems', 'purchases',
+                    'inventoryTransactions', 'products', 'recipeItems', 'orders', 'orderItems', 'auditLogs'
+                ];
+                for (let name of defaultStores) {
+                    result[name] = this._data[name] || [];
+                }
+                return result;
+            }
+
+            setAllData(data) {
+                const defaultStores = ['users', 'settings', 'categories', 'inventoryItems', 'purchases',
+                    'inventoryTransactions', 'products', 'recipeItems', 'orders', 'orderItems', 'auditLogs'
+                ];
+                for (let name of defaultStores) {
+                    if (data[name] && Array.isArray(data[name])) {
+                        this._data[name] = data[name];
+                        localStorage.setItem('store_' + name, JSON.stringify(data[name]));
+                        // Fix counters
+                        let maxId = 0;
+                        for (let item of data[name]) {
+                            if (item.id && item.id > maxId) maxId = item.id;
+                        }
+                        this._counters[name] = maxId + 1;
+                    }
+                }
+            }
+        }
+
+        // ---- IndexedDB Engine ----
+        class IndexedDBEngine {
+            constructor() {
+                this.db = null;
+                this.state = 'opening';
+                this.readyPromise = this._init();
+                this._stores = ['users', 'settings', 'categories', 'inventoryItems', 'purchases',
+                    'inventoryTransactions', 'products', 'recipeItems', 'orders', 'orderItems', 'auditLogs'
+                ];
+            }
+
+            async _init() {
+                return new Promise((resolve, reject) => {
+                    if (!window.indexedDB) {
+                        reject('IndexedDB not supported');
+                        return;
+                    }
+                    const request = window.indexedDB.open('StoreManagerDB_V4', 2);
+                    request.onupgradeneeded = (event) => {
+                        const db = event.target.result;
+                        const tx = event.target.transaction;
+                        this._createSchema(db, tx);
+                    };
+                    request.onsuccess = (event) => {
+                        this.db = event.target.result;
+                        this.state = 'ready';
+                        this.db.onversionchange = () => {
+                            if (this.db) this.db.close();
+                        };
+                        resolve();
+                    };
+                    request.onerror = (e) => {
+                        reject(e.target.error.message);
+                    };
+                    request.onblocked = () => {
+                        reject('Database blocked by another connection');
+                    };
+                });
+            }
+
+            _createSchema(db, tx) {
+                const stores = [
+                    { name: 'users', keyPath: 'id', autoIncrement: true },
+                    { name: 'settings', keyPath: 'id' },
+                    { name: 'categories', keyPath: 'id', autoIncrement: true },
+                    { name: 'inventoryItems', keyPath: 'id', autoIncrement: true },
+                    { name: 'purchases', keyPath: 'id', autoIncrement: true },
+                    { name: 'inventoryTransactions', keyPath: 'id', autoIncrement: true },
+                    { name: 'products', keyPath: 'id', autoIncrement: true },
+                    { name: 'recipeItems', keyPath: 'id', autoIncrement: true },
+                    { name: 'orders', keyPath: 'id', autoIncrement: true },
+                    { name: 'orderItems', keyPath: 'id', autoIncrement: true },
+                    { name: 'auditLogs', keyPath: 'id', autoIncrement: true }
+                ];
+                for (let s of stores) {
+                    if (!db.objectStoreNames.contains(s.name)) {
+                        db.createObjectStore(s.name, { keyPath: s.keyPath, autoIncrement: s.autoIncrement || false });
+                    }
+                }
+            }
+
+            async _execute(storeName, mode, operation, data) {
+                await this.readyPromise;
+                if (!this.db) throw new Error('Database not ready');
+                return new Promise((resolve, reject) => {
+                    try {
+                        const tx = this.db.transaction(storeName, mode);
+                        const store = tx.objectStore(storeName);
+                        const request = data !== undefined ? store[operation](data) : store[operation]();
+                        request.onsuccess = (e) => resolve(e.target.result);
+                        request.onerror = (e) => reject(new Error(e.target.error.message));
+                        tx.onerror = (e) => reject(new Error(e.target.error.message));
+                    } catch (err) {
+                        reject(err);
+                    }
+                });
+            }
+
+            async transaction(storeNames, mode, callback) {
+                await this.readyPromise;
+                if (!this.db) throw new Error('Database not ready');
+                const tx = this.db.transaction(storeNames, mode);
+                try {
+                    const wrappedTx = {
+                        objectStore: (storeName) => {
+                            const store = tx.objectStore(storeName);
+                            return {
+                                get: (id) => new Promise((res, rej) => {
+                                    const req = store.get(id);
+                                    req.onsuccess = () => res(req.result);
+                                    req.onerror = () => rej(req.error);
+                                }),
+                                add: (data) => new Promise((res, rej) => {
+                                    const req = store.add(data);
+                                    req.onsuccess = () => res(req.result);
+                                    req.onerror = () => rej(req.error);
+                                }),
+                                put: (data) => new Promise((res, rej) => {
+                                    const req = store.put(data);
+                                    req.onsuccess = () => res(req.result);
+                                    req.onerror = () => rej(req.error);
+                                }),
+                                delete: (id) => new Promise((res, rej) => {
+                                    const req = store.delete(id);
+                                    req.onsuccess = () => res(req.result);
+                                    req.onerror = () => rej(req.error);
+                                })
+                            };
+                        }
+                    };
+                    const result = await callback(wrappedTx);
+                    await new Promise((resolve, reject) => {
+                        tx.oncomplete = resolve;
+                        tx.onerror = (e) => reject(new Error(e.target.error.message));
+                        tx.onabort = (e) => reject(new Error('Transaction aborted'));
+                    });
+                    return result;
+                } catch (err) {
+                    tx.abort();
+                    throw err;
+                }
+            }
+
+            async add(store, data) { return this._execute(store, 'readwrite', 'add', data); }
+            async put(store, data) { return this._execute(store, 'readwrite', 'put', data); }
+            async get(store, id) { return this._execute(store, 'readonly', 'get', id); }
+            async getAll(store) { return this._execute(store, 'readonly', 'getAll'); }
+            async delete(store, id) { return this._execute(store, 'readwrite', 'delete', id); }
+            async waitReady() { await this.readyPromise; return true; }
+
+            async getAllData() {
+                await this.readyPromise;
+                const result = {};
+                for (let name of this._stores) {
+                    result[name] = await this.getAll(name);
+                }
+                return result;
+            }
+
+            async setAllData(data) {
+                await this.readyPromise;
+                const storeNames = this._stores;
+                for (let name of storeNames) {
+                    const existing = await this.getAll(name);
+                    for (let item of existing) {
+                        await this.delete(name, item.id);
+                    }
+                }
+                for (let name of storeNames) {
+                    if (data[name] && Array.isArray(data[name])) {
+                        for (let record of data[name]) {
+                            if (record.id !== undefined && record.id !== null) {
+                                await this.put(name, record);
+                            } else {
+                                await this.add(name, record);
+                            }
+                        }
+                    }
+                }
+            }
+
+            resetAll() {
+                return Promise.resolve();
             }
         }
 
         // ================================================================
-        // DATABASE CLASS
+        // DATABASE WRAPPER
         // ================================================================
+        let DBInstance = null;
+        let DBReady = false;
+        let DBInitPromise = null;
+
+        async function ensureDBReady() {
+            if (DBReady && DBInstance) return DBInstance;
+            if (DBInitPromise) return DBInitPromise;
+            DBInitPromise = (async () => {
+                try {
+                    if (!DBInstance) {
+                        DBInstance = new Database();
+                    }
+                    await DBInstance.waitReady();
+                    DBReady = true;
+                    return DBInstance;
+                } catch (e) {
+                    console.error('Database initialization failed:', e);
+                    throw e;
+                }
+            })();
+            return DBInitPromise;
+        }
+
         class Database {
             constructor() {
                 this.engine = null;
                 this.state = 'opening';
                 this.errorMsg = null;
-                this.readyPromise = this.init();
+                this.readyPromise = this._init();
+                this._useIndexedDB = true;
             }
 
-            async init() {
+            async _init() {
                 try {
                     const idb = new IndexedDBEngine();
                     await idb.readyPromise;
                     this.engine = idb;
+                    this._useIndexedDB = true;
                     console.log('Using IndexedDB engine');
                 } catch (e) {
                     console.warn('IndexedDB failed, falling back to localStorage', e);
                     this.engine = new LocalStorageEngine();
+                    this._useIndexedDB = false;
                     console.log('Using localStorage engine');
                 }
                 this.state = 'ready';
-                await this.ensureDefaultData();
+                await this._ensureDefaultData();
                 const infoEl = document.getElementById('loginInfo');
                 if (infoEl) infoEl.style.display = 'none';
                 return true;
@@ -1711,18 +1960,16 @@
                 return true;
             }
 
-            async ensureDefaultData() {
+            async _ensureDefaultData() {
                 await this.waitReady();
                 const users = await this.getAll('users');
                 if (!users || users.length === 0) {
                     const adminHash = await this.hashPassword('admin123');
                     const cashierHash = await this.hashPassword('cashier123');
-                    await this.add('users', { id: 1, username: 'admin', password: adminHash, role: 'admin',
-                    name: 'المدير' });
-                    await this.add('users', { id: 2, username: 'cashier', password: cashierHash, role: 'cashier',
-                        name: 'الكاشير' });
+                    await this.add('users', { username: 'admin', password: adminHash, role: 'admin', name: 'المدير' });
+                    await this.add('users', { username: 'cashier', password: cashierHash, role: 'cashier',
+                    name: 'الكاشير' });
                 }
-
                 const settings = await this.get('settings', 1);
                 if (!settings) {
                     await this.add('settings', {
@@ -1740,7 +1987,6 @@
                         logo: null
                     });
                 }
-
                 const cats = await this.getAll('categories');
                 if (!cats || cats.length === 0) {
                     const defaultCats = ['ملابس', 'عطور', 'إكسسوارات', 'أحذية', 'حقائب', 'أخرى'];
@@ -1748,7 +1994,6 @@
                         await this.add('categories', { name });
                     }
                 }
-
                 const orders = await this.getAll('orders');
                 if (orders && orders.length > 0) {
                     let maxOrderNum = 0;
@@ -1759,6 +2004,8 @@
                     }
                     if (maxOrderNum > 0) AppState.orderNumber = maxOrderNum + 1;
                 }
+                const set = await this.get('settings', 1);
+                if (set) AppState.settings = set;
             }
 
             async hashPassword(password) {
@@ -1801,165 +2048,142 @@
                 return this.engine.delete(store, id);
             }
 
-            async loadDemoData() {
-                try {
-                    await this.waitReady();
-                    const existingItems = await this.getAll('inventoryItems');
-                    if (existingItems && existingItems.length > 0) {
-                        this.showToast('البيانات موجودة بالفعل، لا حاجة لتحميلها مرة أخرى.', 'info');
-                        return;
-                    }
-                    const categories = await this.getAll('categories');
-                    const catMap = {};
-                    categories.forEach(c => catMap[c.name] = c.id);
-
-                    const inventoryData = [
-                        { name: 'تيشيرت بولو قطن', sku: 'TS-001', category: catMap['ملابس'] || 1, unit: 'قطعة',
-                            quantity: 50, minStock: 5, maxStock: 100, unitCost: 150, supplier: 'مصنع المنسوجات',
-                            notes: '' },
-                        { name: 'بنطلون جينز كلاسيك', sku: 'JN-001', category: catMap['ملابس'] || 1, unit: 'قطعة',
-                            quantity: 30, minStock: 5, maxStock: 50, unitCost: 250, supplier: 'مصنع الجينز',
-                        notes: '' },
-                        { name: 'عطر رجالي فرنسي 100مل', sku: 'PF-001', category: catMap['عطور'] || 2, unit: 'زجاجة',
-                            quantity: 20, minStock: 3, maxStock: 30, unitCost: 500, supplier: 'مورد العطور',
-                        notes: '' },
-                        { name: 'ساعة يد معدنية', sku: 'WT-001', category: catMap['إكسسوارات'] || 3, unit: 'قطعة',
-                            quantity: 15, minStock: 2, maxStock: 20, unitCost: 350, supplier: 'وكيل الساعات',
-                        notes: '' },
-                        { name: 'بوكس هدايا فارغ', sku: 'BX-001', category: catMap['أخرى'] || 6, unit: 'قطعة',
-                            quantity: 100, minStock: 20, maxStock: 200, unitCost: 20, supplier: 'مصنع الكرتون',
-                            notes: '' }
-                    ];
-
-                    const invIds = {};
-                    for (const item of inventoryData) {
-                        const id = await this.add('inventoryItems', item);
-                        invIds[item.sku] = id;
-                    }
-
-                    const productsData = [
-                        { name: 'تيشيرت بولو قطن', category: catMap['ملابس'] || 1, price: 300, status: 'active',
-                            recipe: [{ sku: 'TS-001', qty: 1 }] },
-                        { name: 'بنطلون جينز كلاسيك', category: catMap['ملابس'] || 1, price: 450, status: 'active',
-                            recipe: [{ sku: 'JN-001', qty: 1 }] },
-                        { name: 'عطر رجالي فرنسي', category: catMap['عطور'] || 2, price: 800, status: 'active',
-                            recipe: [{ sku: 'PF-001', qty: 1 }] },
-                        { name: 'ساعة يد معدنية', category: catMap['إكسسوارات'] || 3, price: 600, status: 'active',
-                            recipe: [{ sku: 'WT-001', qty: 1 }] },
-                        { name: 'طقم هدية (عطر + ساعة)', category: catMap['إكسسوارات'] || 3, price: 1400,
-                            status: 'active', recipe: [{ sku: 'PF-001', qty: 1 }, { sku: 'WT-001', qty: 1 },
-                            { sku: 'BX-001', qty: 1 }] }
-                    ];
-
-                    for (const p of productsData) {
-                        const pid = await this.add('products', { name: p.name, category: p.category, price: p.price,
-                            status: p.status });
-                        for (const r of p.recipe) {
-                            const invId = invIds[r.sku];
-                            if (invId) {
-                                await this.add('recipeItems', { productId: pid, inventoryItemId: invId,
-                                    quantity: r.qty });
-                            }
-                        }
-                    }
-
-                    this.showToast('تم تحميل بيانات المتجر التجريبية بنجاح', 'success');
-                } catch (e) {
-                    console.error(e);
-                    this.showToast('خطأ في تحميل البيانات: ' + e.message, 'error');
+            async transaction(storeNames, mode, callback) {
+                await this.waitReady();
+                if (this.engine.transaction) {
+                    return this.engine.transaction(storeNames, mode, callback);
+                } else {
+                    return callback({
+                        objectStore: (name) => ({
+                            add: (data) => this.add(name, data),
+                            put: (data) => this.put(name, data),
+                            get: (id) => this.get(name, id),
+                            getAll: () => this.getAll(name),
+                            delete: (id) => this.delete(name, id)
+                        })
+                    });
                 }
             }
 
-            showToast(message, type = 'info') {
-                const container = document.getElementById('toastContainer');
-                if (!container) return;
-                const toast = document.createElement('div');
-                toast.className = 'toast ' + type;
-                toast.textContent = message;
-                container.appendChild(toast);
-                setTimeout(() => {
-                    toast.style.opacity = '0';
-                    toast.style.transform = 'translateX(100px)';
-                    setTimeout(() => toast.remove(), 300);
-                }, 3000);
-            }
-        }
-
-        // ================================================================
-        // IndexedDB Engine
-        // ================================================================
-        class IndexedDBEngine {
-            constructor() {
-                this.db = null;
-                this.state = 'opening';
-                this.readyPromise = this._init();
-            }
-
-            async _init() {
-                return new Promise((resolve, reject) => {
-                    if (!window.indexedDB) {
-                        reject('IndexedDB not supported');
-                        return;
-                    }
-                    const request = window.indexedDB.open('StoreManagerDB_V2', 1);
-                    request.onupgradeneeded = (event) => {
-                        const db = event.target.result;
-                        const tx = event.target.transaction;
-                        this._createSchema(db, tx);
-                    };
-                    request.onsuccess = (event) => {
-                        this.db = event.target.result;
-                        this.state = 'ready';
-                        resolve();
-                    };
-                    request.onerror = (e) => {
-                        reject(e.target.error.message);
-                    };
-                });
-            }
-
-            _createSchema(db, tx) {
-                const stores = [
-                    { name: 'users', keyPath: 'id', autoIncrement: true },
-                    { name: 'settings', keyPath: 'id' },
-                    { name: 'categories', keyPath: 'id', autoIncrement: true },
-                    { name: 'inventoryItems', keyPath: 'id', autoIncrement: true },
-                    { name: 'purchases', keyPath: 'id', autoIncrement: true },
-                    { name: 'inventoryTransactions', keyPath: 'id', autoIncrement: true },
-                    { name: 'products', keyPath: 'id', autoIncrement: true },
-                    { name: 'recipeItems', keyPath: 'id', autoIncrement: true },
-                    { name: 'orders', keyPath: 'id', autoIncrement: true },
-                    { name: 'orderItems', keyPath: 'id', autoIncrement: true },
-                    { name: 'auditLogs', keyPath: 'id', autoIncrement: true }
+            async getAllData() {
+                await this.waitReady();
+                if (this.engine.getAllData) {
+                    return this.engine.getAllData();
+                }
+                const stores = ['users', 'settings', 'categories', 'inventoryItems', 'purchases',
+                    'inventoryTransactions', 'products', 'recipeItems', 'orders', 'orderItems', 'auditLogs'
                 ];
-                stores.forEach(s => {
-                    if (!db.objectStoreNames.contains(s.name)) {
-                        db.createObjectStore(s.name, { keyPath: s.keyPath, autoIncrement: s.autoIncrement ||
-                                false });
+                const result = {};
+                for (let name of stores) {
+                    result[name] = await this.getAll(name);
+                }
+                return result;
+            }
+
+            async setAllData(data) {
+                await this.waitReady();
+                if (this.engine.setAllData) {
+                    return this.engine.setAllData(data);
+                }
+                const stores = ['users', 'settings', 'categories', 'inventoryItems', 'purchases',
+                    'inventoryTransactions', 'products', 'recipeItems', 'orders', 'orderItems', 'auditLogs'
+                ];
+                for (let name of stores) {
+                    const existing = await this.getAll(name);
+                    for (let item of existing) {
+                        await this.delete(name, item.id);
                     }
-                });
+                }
+                for (let name of stores) {
+                    if (data[name] && Array.isArray(data[name])) {
+                        for (let record of data[name]) {
+                            if (record.id !== undefined && record.id !== null) {
+                                await this.put(name, record);
+                            } else {
+                                await this.add(name, record);
+                            }
+                        }
+                    }
+                }
             }
 
-            async _execute(storeName, mode, operation, data) {
-                await this.readyPromise;
-                return new Promise((resolve, reject) => {
-                    const tx = this.db.transaction(storeName, mode);
-                    const store = tx.objectStore(storeName);
-                    const request = data !== undefined ? store[operation](data) : store[operation]();
-                    request.onsuccess = (e) => resolve(e.target.result);
-                    request.onerror = (e) => reject(new Error(e.target.error.message));
-                });
+            async clearAllStores() {
+                await this.waitReady();
+                const stores = ['users', 'settings', 'categories', 'inventoryItems', 'purchases',
+                    'inventoryTransactions', 'products', 'recipeItems', 'orders', 'orderItems', 'auditLogs'
+                ];
+                for (let name of stores) {
+                    const items = await this.getAll(name);
+                    for (let item of items) {
+                        await this.delete(name, item.id);
+                    }
+                }
+                AppState.orderNumber = 1;
+                await this._ensureDefaultData();
             }
 
-            async add(store, data) { return this._execute(store, 'readwrite', 'add', data); }
-            async put(store, data) { return this._execute(store, 'readwrite', 'put', data); }
-            async get(store, id) { return this._execute(store, 'readonly', 'get', id); }
-            async getAll(store) { return this._execute(store, 'readonly', 'getAll'); }
-            async delete(store, id) { return this._execute(store, 'readwrite', 'delete', id); }
+            async loadDemoData() {
+                await this.waitReady();
+                const existingItems = await this.getAll('inventoryItems');
+                if (existingItems && existingItems.length > 0) {
+                    showToast('البيانات موجودة بالفعل، لا حاجة لتحميلها مرة أخرى.', 'info');
+                    return;
+                }
+                const categories = await this.getAll('categories');
+                const catMap = {};
+                categories.forEach(c => catMap[c.name] = c.id);
 
-            async waitReady() {
-                await this.readyPromise;
-                return true;
+                const inventoryData = [
+                    { name: 'تيشيرت بولو قطن', sku: 'TS-001', category: catMap['ملابس'] || 1, unit: 'قطعة',
+                        quantity: 50, minStock: 5, maxStock: 100, unitCost: 150, supplier: 'مصنع المنسوجات',
+                        notes: '' },
+                    { name: 'بنطلون جينز كلاسيك', sku: 'JN-001', category: catMap['ملابس'] || 1, unit: 'قطعة',
+                        quantity: 30, minStock: 5, maxStock: 50, unitCost: 250, supplier: 'مصنع الجينز',
+                    notes: '' },
+                    { name: 'عطر رجالي فرنسي 100مل', sku: 'PF-001', category: catMap['عطور'] || 2, unit: 'زجاجة',
+                        quantity: 20, minStock: 3, maxStock: 30, unitCost: 500, supplier: 'مورد العطور',
+                    notes: '' },
+                    { name: 'ساعة يد معدنية', sku: 'WT-001', category: catMap['إكسسوارات'] || 3, unit: 'قطعة',
+                        quantity: 15, minStock: 2, maxStock: 20, unitCost: 350, supplier: 'وكيل الساعات',
+                    notes: '' },
+                    { name: 'بوكس هدايا فارغ', sku: 'BX-001', category: catMap['أخرى'] || 6, unit: 'قطعة',
+                        quantity: 100, minStock: 20, maxStock: 200, unitCost: 20, supplier: 'مصنع الكرتون',
+                        notes: '' }
+                ];
+
+                const invIds = {};
+                for (const item of inventoryData) {
+                    const id = await this.add('inventoryItems', item);
+                    invIds[item.sku] = id;
+                }
+
+                const productsData = [
+                    { name: 'تيشيرت بولو قطن', category: catMap['ملابس'] || 1, price: 300, status: 'active',
+                        recipe: [{ sku: 'TS-001', qty: 1 }] },
+                    { name: 'بنطلون جينز كلاسيك', category: catMap['ملابس'] || 1, price: 450, status: 'active',
+                        recipe: [{ sku: 'JN-001', qty: 1 }] },
+                    { name: 'عطر رجالي فرنسي', category: catMap['عطور'] || 2, price: 800, status: 'active',
+                        recipe: [{ sku: 'PF-001', qty: 1 }] },
+                    { name: 'ساعة يد معدنية', category: catMap['إكسسوارات'] || 3, price: 600, status: 'active',
+                        recipe: [{ sku: 'WT-001', qty: 1 }] },
+                    { name: 'طقم هدية (عطر + ساعة)', category: catMap['إكسسوارات'] || 3, price: 1400,
+                        status: 'active', recipe: [{ sku: 'PF-001', qty: 1 }, { sku: 'WT-001', qty: 1 },
+                        { sku: 'BX-001', qty: 1 }] }
+                ];
+
+                for (const p of productsData) {
+                    const pid = await this.add('products', { name: p.name, category: p.category, price: p.price,
+                        status: p.status });
+                    for (const r of p.recipe) {
+                        const invId = invIds[r.sku];
+                        if (invId) {
+                            await this.add('recipeItems', { productId: pid, inventoryItemId: invId,
+                                quantity: r.qty });
+                        }
+                    }
+                }
+
+                showToast('تم تحميل بيانات المتجر التجريبية بنجاح', 'success');
             }
         }
 
@@ -1968,13 +2192,8 @@
         // ================================================================
         async function initApp() {
             startClock();
-            DBInstance = new Database();
-            window.DB = DBInstance;
-            document.getElementById('loginPassword').addEventListener('keydown', e => {
-                if (e.key === 'Enter') login();
-            });
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const orders = await DBInstance.getAll('orders');
                 if (orders && orders.length > 0) {
                     let maxNum = 0;
@@ -1987,12 +2206,16 @@
                 }
                 const set = await DBInstance.get('settings', 1);
                 if (set) AppState.settings = set;
+                document.getElementById('loginInfo').textContent = 'جاهز. أدخل كلمة المرور';
             } catch (e) {
-                const errEl = document.getElementById('loginError');
-                errEl.textContent = 'فشل التهيئة: ' + e.message;
-                errEl.style.display = 'block';
+                document.getElementById('loginError').textContent = 'فشل التهيئة: ' + e.message;
+                document.getElementById('loginError').style.display = 'block';
                 document.getElementById('loginInfo').style.display = 'none';
+                console.error('Init error:', e);
             }
+            document.getElementById('loginPassword').addEventListener('keydown', function(e) {
+                if (e.key === 'Enter') login();
+            });
         }
 
         async function login() {
@@ -2005,7 +2228,7 @@
                 return;
             }
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const users = await DBInstance.getAll('users');
                 if (!users || users.length === 0) {
                     err.textContent = 'لا يوجد مستخدمون. تأكد من تهيئة قاعدة البيانات.';
@@ -2020,7 +2243,7 @@
                     document.getElementById('loginScreen').style.display = 'none';
                     document.getElementById('appContainer').style.display = 'block';
                     document.getElementById('currentUserNameDisplay').textContent = matchedUser.name || matchedUser
-                    .username;
+                        .username;
 
                     document.querySelectorAll('.sidebar .nav-item').forEach(item => {
                         const roles = item.getAttribute('data-role');
@@ -2030,7 +2253,7 @@
                     await loadSettings();
                     if (AppState.currentRole === 'cashier') await navigateTo('pos');
                     else await navigateTo('dashboard');
-                    DBInstance.showToast('مرحبًا (' + (matchedUser.name || matchedUser.username) + ')', 'success');
+                    showToast('مرحبًا (' + (matchedUser.name || matchedUser.username) + ')', 'success');
                 } else {
                     err.textContent = 'كلمة المرور غير صحيحة';
                     err.style.display = 'block';
@@ -2038,6 +2261,7 @@
             } catch (e) {
                 err.textContent = 'خطأ: ' + e.message;
                 err.style.display = 'block';
+                console.error('Login error:', e);
             }
         }
 
@@ -2056,6 +2280,13 @@
             }, 1000);
         }
 
+        function toggleSidebar() {
+            const sidebar = document.getElementById('sidebar');
+            const overlay = document.getElementById('mobileOverlay');
+            sidebar.classList.toggle('open');
+            if (overlay) overlay.classList.toggle('active');
+        }
+
         // ================================================================
         // NAVIGATION
         // ================================================================
@@ -2065,7 +2296,7 @@
             document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
             document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
             targetPage.classList.add('active');
-            const nav = document.querySelector(`.nav-item[data-page="${page}"]`);
+            const nav = document.querySelector('.nav-item[data-page="' + page + '"]');
             if (nav) nav.classList.add('active');
 
             const titles = {
@@ -2086,6 +2317,7 @@
             }
 
             try {
+                await ensureDBReady();
                 switch (page) {
                     case 'dashboard':
                         await renderDashboard();
@@ -2118,7 +2350,18 @@
                 }
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في تحميل الصفحة: ' + e.message, 'error');
+                showToast('خطأ في تحميل الصفحة: ' + e.message, 'error');
+            }
+        }
+
+        function refreshCurrentPage() {
+            const active = document.querySelector('.page.active');
+            if (active) {
+                const id = active.id;
+                if (id) {
+                    const page = id.replace('page-', '');
+                    navigateTo(page);
+                }
             }
         }
 
@@ -2127,7 +2370,7 @@
             document.querySelectorAll('.settings-tabs button').forEach(b => b.classList.remove('active'));
             const panel = document.getElementById('stab-' + stab);
             if (panel) panel.classList.add('active');
-            const btn = document.querySelector(`.settings-tabs button[data-stab="${stab}"]`);
+            const btn = document.querySelector('.settings-tabs button[data-stab="' + stab + '"]');
             if (btn) btn.classList.add('active');
             if (stab === 'categories') renderCategories();
         }
@@ -2150,7 +2393,7 @@
 
         async function loadSettings() {
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const set = await DBInstance.get('settings', 1);
                 if (set) {
                     AppState.settings = set;
@@ -2184,7 +2427,7 @@
         async function saveSettings(e) {
             e.preventDefault();
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const set = {
                     ...AppState.settings,
                     restaurantName: document.getElementById('setRestaurantName').value,
@@ -2200,10 +2443,10 @@
                 await DBInstance.put('settings', set);
                 AppState.settings = set;
                 await loadSettings();
-                DBInstance.showToast('تم حفظ الإعدادات', 'success');
+                showToast('تم حفظ الإعدادات', 'success');
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في حفظ الإعدادات: ' + e.message, 'error');
+                showToast('خطأ في حفظ الإعدادات: ' + e.message, 'error');
             }
         }
 
@@ -2214,30 +2457,30 @@
             const confirmPassword = document.getElementById('confirmPassword').value;
 
             if (!currentPassword || !newPassword || !confirmPassword) {
-                DBInstance.showToast('جميع الحقول مطلوبة', 'warning');
+                showToast('جميع الحقول مطلوبة', 'warning');
                 return;
             }
             if (newPassword.length < 4) {
-                DBInstance.showToast('كلمة المرور الجديدة يجب أن تكون 4 أحرف على الأقل', 'warning');
+                showToast('كلمة المرور الجديدة يجب أن تكون 4 أحرف على الأقل', 'warning');
                 return;
             }
             if (newPassword !== confirmPassword) {
-                DBInstance.showToast('كلمتا المرور غير متطابقتين', 'error');
+                showToast('كلمتا المرور غير متطابقتين', 'error');
                 return;
             }
 
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const users = await DBInstance.getAll('users');
                 const currentUser = users.find(u => u.username === AppState.currentUser);
                 if (!currentUser) {
-                    DBInstance.showToast('المستخدم غير موجود', 'error');
+                    showToast('المستخدم غير موجود', 'error');
                     return;
                 }
 
                 const hashedCurrent = await DBInstance.hashPassword(currentPassword);
                 if (currentUser.password !== hashedCurrent) {
-                    DBInstance.showToast('كلمة المرور الحالية غير صحيحة', 'error');
+                    showToast('كلمة المرور الحالية غير صحيحة', 'error');
                     return;
                 }
 
@@ -2248,17 +2491,17 @@
                 document.getElementById('currentPassword').value = '';
                 document.getElementById('newPassword').value = '';
                 document.getElementById('confirmPassword').value = '';
-                DBInstance.showToast('تم تغيير كلمة المرور بنجاح', 'success');
+                showToast('تم تغيير كلمة المرور بنجاح', 'success');
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في تغيير كلمة المرور: ' + e.message, 'error');
+                showToast('خطأ في تغيير كلمة المرور: ' + e.message, 'error');
             }
         }
 
         async function saveReceiptSettings(e) {
             e.preventDefault();
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const set = {
                     ...AppState.settings,
                     receiptWidth: parseInt(document.getElementById('setReceiptWidth').value) || 80,
@@ -2268,10 +2511,10 @@
                 set.id = 1;
                 await DBInstance.put('settings', set);
                 AppState.settings = set;
-                DBInstance.showToast('تم حفظ إعدادات الإيصال', 'success');
+                showToast('تم حفظ إعدادات الإيصال', 'success');
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في حفظ إعدادات الإيصال: ' + e.message, 'error');
+                showToast('خطأ في حفظ إعدادات الإيصال: ' + e.message, 'error');
             }
         }
 
@@ -2280,7 +2523,7 @@
         // ================================================================
         async function renderCategories() {
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const container = document.getElementById('categoriesList');
                 const cats = await DBInstance.getAll('categories');
                 if (!cats || cats.length === 0) {
@@ -2302,19 +2545,19 @@
             const input = document.getElementById('newCategoryName');
             const name = input.value.trim();
             if (!name) {
-                DBInstance.showToast('أدخل اسم التصنيف', 'warning');
+                showToast('أدخل اسم التصنيف', 'warning');
                 return;
             }
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const cats = await DBInstance.getAll('categories');
                 if (cats && cats.some(c => c.name.toLowerCase() === name.toLowerCase())) {
-                    DBInstance.showToast('هذا التصنيف موجود بالفعل', 'warning');
+                    showToast('هذا التصنيف موجود بالفعل', 'warning');
                     return;
                 }
                 await DBInstance.add('categories', { name });
                 input.value = '';
-                DBInstance.showToast('تمت إضافة التصنيف', 'success');
+                showToast('تمت إضافة التصنيف', 'success');
                 await renderCategories();
                 await updateCategoryFilters();
                 if (document.getElementById('page-products').classList.contains('active')) await renderProducts();
@@ -2323,24 +2566,24 @@
                 if (document.getElementById('page-pos').classList.contains('active')) await renderPOS();
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في إضافة التصنيف: ' + e.message, 'error');
+                showToast('خطأ في إضافة التصنيف: ' + e.message, 'error');
             }
         }
 
         async function deleteCategory(id) {
             if (!confirm('هل أنت متأكد من حذف هذا التصنيف؟')) return;
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const products = await DBInstance.getAll('products');
                 const items = await DBInstance.getAll('inventoryItems');
                 const usedInProducts = products && products.some(p => p.category === id);
                 const usedInItems = items && items.some(i => i.category === id);
                 if (usedInProducts || usedInItems) {
-                    DBInstance.showToast('لا يمكن حذف التصنيف لأنه مستخدم في منتجات أو أصناف.', 'error');
+                    showToast('لا يمكن حذف التصنيف لأنه مستخدم في منتجات أو أصناف.', 'error');
                     return;
                 }
                 await DBInstance.delete('categories', id);
-                DBInstance.showToast('تم حذف التصنيف', 'success');
+                showToast('تم حذف التصنيف', 'success');
                 await renderCategories();
                 await updateCategoryFilters();
                 if (document.getElementById('page-products').classList.contains('active')) await renderProducts();
@@ -2349,7 +2592,28 @@
                 if (document.getElementById('page-pos').classList.contains('active')) await renderPOS();
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في حذف التصنيف: ' + e.message, 'error');
+                showToast('خطأ في حذف التصنيف: ' + e.message, 'error');
+            }
+        }
+
+        async function updateCategoryFilters() {
+            try {
+                await ensureDBReady();
+                const cats = await DBInstance.getAll('categories') || [];
+                const catOptions = '<option value="all">جميع التصنيفات</option>' +
+                    cats.map(c => '<option value="' + c.id + '">' + escapeHtml(c.name) + '</option>').join('');
+
+                const filterIds = ['itemCodeCategoryFilter', 'inventoryCategoryFilter', 'productCategoryFilter'];
+                for (let id of filterIds) {
+                    const el = document.getElementById(id);
+                    if (el) {
+                        const current = el.value;
+                        el.innerHTML = catOptions;
+                        if (current) el.value = current;
+                    }
+                }
+            } catch (e) {
+                console.error(e);
             }
         }
 
@@ -2358,16 +2622,15 @@
         // ================================================================
         async function backupDatabase() {
             try {
-                await DBInstance.waitReady();
-                const storeNames = ['users', 'settings', 'categories', 'inventoryItems', 'purchases',
-                    'inventoryTransactions', 'products', 'recipeItems', 'orders', 'orderItems', 'auditLogs'
-                ];
-                const backupData = {};
-                for (let storeName of storeNames) {
-                    backupData[storeName] = await DBInstance.getAll(storeName) || [];
-                }
-                const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(backupData, null,
-                2));
+                await ensureDBReady();
+                const data = await DBInstance.getAllData();
+                const backup = {
+                    version: 2,
+                    database: 'StoreManagerDB_V4',
+                    createdAt: new Date().toISOString(),
+                    stores: data
+                };
+                const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(backup, null, 2));
                 const downloadAnchor = document.createElement('a');
                 downloadAnchor.setAttribute("href", dataStr);
                 downloadAnchor.setAttribute("download", "StoreManager_Backup_" + new Date().toISOString().split('T')[0] +
@@ -2375,10 +2638,10 @@
                 document.body.appendChild(downloadAnchor);
                 downloadAnchor.click();
                 downloadAnchor.remove();
-                DBInstance.showToast('تم إنشاء النسخة الاحتياطية وتحميلها بنجاح', 'success');
+                showToast('تم إنشاء النسخة الاحتياطية وتحميلها بنجاح', 'success');
             } catch (err) {
                 console.error(err);
-                DBInstance.showToast('فشل إنشاء النسخة الاحتياطية: ' + err.message, 'error');
+                showToast('فشل إنشاء النسخة الاحتياطية: ' + err.message, 'error');
             }
         }
 
@@ -2388,35 +2651,25 @@
             const reader = new FileReader();
             reader.onload = async function(e) {
                 try {
-                    const backupData = JSON.parse(e.target.result);
-                    await DBInstance.waitReady();
+                    const backup = JSON.parse(e.target.result);
+                    if (!backup.version || !backup.stores || typeof backup.stores !== 'object') {
+                        showToast('ملف النسخة الاحتياطية غير صالح: بنية غير صحيحة', 'error');
+                        return;
+                    }
                     const requiredStores = ['users', 'settings', 'categories', 'inventoryItems', 'products',
-                        'recipeItems', 'orders', 'purchases'
+                        'recipeItems', 'orders', 'orderItems', 'purchases'
                     ];
                     for (let name of requiredStores) {
-                        if (!backupData[name]) {
-                            DBInstance.showToast('ملف النسخة الاحتياطية غير مكتمل (يفتقر إلى: ' + name + ')',
-                            'error');
+                        if (!backup.stores[name] || !Array.isArray(backup.stores[name])) {
+                            showToast('ملف النسخة الاحتياطية غير مكتمل (يفتقر إلى: ' + name + ')', 'error');
                             return;
                         }
                     }
-                    const storeNames = Object.keys(backupData);
-                    for (let storeName of storeNames) {
-                        const existing = await DBInstance.getAll(storeName) || [];
-                        for (let item of existing) {
-                            await DBInstance.delete(storeName, item.id);
-                        }
-                    }
-                    for (let storeName of storeNames) {
-                        const records = backupData[storeName] || [];
-                        for (let record of records) {
-                            if (record.id !== undefined && record.id !== null) {
-                                await DBInstance.put(storeName, record);
-                            } else {
-                                await DBInstance.add(storeName, record);
-                            }
-                        }
-                    }
+                    if (!confirm('سيتم استبدال جميع البيانات الحالية. هل أنت متأكد؟')) return;
+
+                    await ensureDBReady();
+                    await DBInstance.setAllData(backup.stores);
+
                     const orders = await DBInstance.getAll('orders');
                     if (orders && orders.length > 0) {
                         let maxNum = 0;
@@ -2429,11 +2682,12 @@
                     }
                     const set = await DBInstance.get('settings', 1);
                     if (set) AppState.settings = set;
-                    DBInstance.showToast('تمت استعادة النسخة الاحتياطية بنجاح', 'success');
+
+                    showToast('تمت استعادة النسخة الاحتياطية بنجاح', 'success');
                     setTimeout(() => window.location.reload(), 1500);
                 } catch (err) {
                     console.error(err);
-                    DBInstance.showToast('ملف النسخة الاحتياطية غير صالح أو تالف: ' + err.message, 'error');
+                    showToast('ملف النسخة الاحتياطية غير صالح أو تالف: ' + err.message, 'error');
                 }
             };
             reader.readAsText(file);
@@ -2441,11 +2695,69 @@
         }
 
         // ================================================================
+        // CLEAR ALL DATA
+        // ================================================================
+        async function clearAllData() {
+            if (!confirm('تحذير: سيتم حذف جميع الفواتير والمخزون نهائياً. تأكيد؟')) return;
+            if (!confirm('هل أنت متأكد تماماً؟ هذا الإجراء لا يمكن التراجع عنه.')) return;
+
+            try {
+                await ensureDBReady();
+                await DBInstance.clearAllStores();
+
+                AppState.orderNumber = 1;
+                AppState.cart = [];
+                AppState.cartDiscount = 0;
+                updateCartDisplay();
+
+                const set = await DBInstance.get('settings', 1);
+                if (set) AppState.settings = set;
+
+                await renderDashboard();
+                await renderProducts();
+                await renderItemCodes();
+                await renderInventory();
+                await renderPurchases();
+                await renderOrders();
+                await renderCategories();
+                await updateCategoryFilters();
+                if (document.getElementById('page-pos').classList.contains('active')) await renderPOS();
+
+                showToast('تم مسح جميع البيانات وإعادة التهيئة', 'success');
+            } catch (e) {
+                console.error(e);
+                showToast('فشل مسح البيانات: ' + e.message, 'error');
+            }
+        }
+
+        // ================================================================
+        // DEMO DATA
+        // ================================================================
+        async function loadDemoData() {
+            if (!confirm('هل أنت متأكد من تحميل بيانات تجريبية (ملابس وعطور)؟')) return;
+            try {
+                await ensureDBReady();
+                await DBInstance.loadDemoData();
+                await renderDashboard();
+                await renderProducts();
+                await renderItemCodes();
+                await renderInventory();
+                await renderCategories();
+                await updateCategoryFilters();
+                if (document.getElementById('page-pos').classList.contains('active')) await renderPOS();
+                showToast('تم تحديث الصفحات بالبيانات التجريبية', 'success');
+            } catch (e) {
+                console.error(e);
+                showToast('فشل تحميل البيانات التجريبية: ' + e.message, 'error');
+            }
+        }
+
+        // ================================================================
         // DASHBOARD with CHARTS
         // ================================================================
         async function renderDashboard() {
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const today = new Date().toISOString().split('T')[0];
                 const orders = await DBInstance.getAll('orders') || [];
                 const todayOrders = orders.filter(o => o.date === today && o.status === 'paid');
@@ -2459,7 +2771,6 @@
                     .toFixed(2) : '0.00';
                 document.getElementById('statTodayProfit').textContent = profit.toFixed(2);
 
-                // Top products
                 const pSales = {};
                 todayOrders.forEach(o => {
                     if (o.items) {
@@ -2477,7 +2788,6 @@
                     ).join('') :
                     '<p style="color:#999;text-align:center;">لا مبيعات اليوم</p>';
 
-                // ---- CHARTS ----
                 drawSalesChart(orders);
                 drawPaymentChart(todayOrders);
                 drawCategoryChart(orders);
@@ -2486,7 +2796,6 @@
             }
         }
 
-        // ----- SALES CHART (last 7 days) -----
         function drawSalesChart(orders) {
             const canvas = document.getElementById('salesChart');
             if (!canvas) return;
@@ -2524,7 +2833,6 @@
 
             ctx.clearRect(0, 0, W, H);
 
-            // Grid lines
             ctx.strokeStyle = '#f0f0f0';
             ctx.lineWidth = 1;
             for (let i = 0; i <= 4; i++) {
@@ -2539,7 +2847,6 @@
                 ctx.fillText((maxVal * (i / 4)).toFixed(0), padding.left - 4, y + 3);
             }
 
-            // Bars
             const barWidth = Math.min(chartW / days.length * 0.6, 30);
             const gap = chartW / days.length;
             const colors = ['#0066cc', '#0088ee', '#33aaff', '#66bbff', '#99ddff', '#0066cc', '#004c99'];
@@ -2550,14 +2857,12 @@
                 const y = padding.top + chartH - h;
                 ctx.fillStyle = colors[i % colors.length];
                 ctx.fillRect(x, y, barWidth, h);
-                // Label
                 ctx.fillStyle = '#555';
                 ctx.font = '10px sans-serif';
                 ctx.textAlign = 'center';
                 ctx.fillText(labels[i], x + barWidth / 2, padding.top + chartH + 16);
             });
 
-            // Value on top of bars
             dailyTotals.forEach((val, i) => {
                 if (val > 0) {
                     const x = padding.left + i * gap + (gap - barWidth) / 2;
@@ -2571,7 +2876,6 @@
             });
         }
 
-        // ----- PAYMENT CHART (today) -----
         function drawPaymentChart(todayOrders) {
             const canvas = document.getElementById('paymentChart');
             if (!canvas) return;
@@ -2610,7 +2914,6 @@
             const radius = Math.min(W, H) / 2 - 30;
             let startAngle = -Math.PI / 2;
 
-            // Draw pie
             values.forEach((val, i) => {
                 if (val === 0) return;
                 const slice = (val / total) * 2 * Math.PI;
@@ -2620,7 +2923,6 @@
                 ctx.closePath();
                 ctx.fillStyle = colors[i % colors.length];
                 ctx.fill();
-                // Label
                 const mid = startAngle + slice / 2;
                 const labelR = radius * 0.65;
                 const lx = cx + Math.cos(mid) * labelR;
@@ -2634,7 +2936,6 @@
                 startAngle += slice;
             });
 
-            // Legend
             let legendY = 10;
             const legendX = W - 100;
             ctx.textAlign = 'right';
@@ -2650,7 +2951,6 @@
             });
         }
 
-        // ----- CATEGORY CHART -----
         async function drawCategoryChart(orders) {
             const canvas = document.getElementById('categoryChart');
             if (!canvas) return;
@@ -2670,43 +2970,13 @@
                 cats.forEach(c => catMap[c.id] = c.name);
 
                 const paidOrders = orders.filter(o => o.status === 'paid');
-                const catSales = {};
-                paidOrders.forEach(o => {
-                    if (o.items) {
-                        o.items.forEach(item => {
-                            // We need to find the product category
-                            // Since we don't store category in order items, we use the productId
-                            // But products might have been deleted, so we just use the name as fallback
-                            const catName = item.categoryName || 'أخرى';
-                            catSales[catName] = (catSales[catName] || 0) + ((item.price || 0) * (item
-                            .quantity || 0));
-                        });
-                    }
-                });
-
-                // Also try to get category from products for recent orders
                 const products = await DBInstance.getAll('products') || [];
                 const prodMap = {};
                 products.forEach(p => {
                     prodMap[p.id] = { name: p.name, category: p.category };
                 });
 
-                // Re-calculate using product IDs if available
-                for (const o of paidOrders) {
-                    if (o.items) {
-                        for (const item of o.items) {
-                            if (item.productId && prodMap[item.productId]) {
-                                const catId = prodMap[item.productId].category;
-                                const catName = catMap[catId] || 'أخرى';
-                                // Remove previous entry if it was added under a different name
-                                // Simple approach: we'll rebuild
-                            }
-                        }
-                    }
-                }
-
-                // Rebuild using product mapping
-                const catSales2 = {};
+                const catSales = {};
                 for (const o of paidOrders) {
                     if (o.items) {
                         for (const item of o.items) {
@@ -2717,13 +2987,12 @@
                             } else if (item.categoryName) {
                                 catName = item.categoryName;
                             }
-                            catSales2[catName] = (catSales2[catName] || 0) + ((item.price || 0) * (item.quantity ||
-                            0));
+                            catSales[catName] = (catSales[catName] || 0) + ((item.price || 0) * (item.quantity || 0));
                         }
                     }
                 }
 
-                const entries = Object.entries(catSales2).sort((a, b) => b[1] - a[1]);
+                const entries = Object.entries(catSales).sort((a, b) => b[1] - a[1]);
                 if (entries.length === 0) {
                     ctx.fillStyle = '#ccc';
                     ctx.font = '14px sans-serif';
@@ -2740,7 +3009,6 @@
                 const gap = chartH / entries.length;
 
                 ctx.clearRect(0, 0, W, H);
-
                 const colors = ['#0066cc', '#00aa66', '#ff6b00', '#cc0000', '#9900cc', '#0099cc', '#ff9900'];
 
                 entries.forEach((entry, i) => {
@@ -2751,12 +3019,10 @@
                     const w = (val / maxVal) * chartW;
                     ctx.fillStyle = colors[i % colors.length];
                     ctx.fillRect(x, y, w, barH);
-                    // Label
                     ctx.fillStyle = '#333';
                     ctx.font = '10px sans-serif';
                     ctx.textAlign = 'right';
                     ctx.fillText(name, x - 4, y + barH / 2 + 3);
-                    // Value
                     if (w > 40) {
                         ctx.fillStyle = 'white';
                         ctx.font = '9px sans-serif';
@@ -2783,7 +3049,7 @@
         // ================================================================
         async function renderProducts() {
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const cats = await DBInstance.getAll('categories') || [];
                 const catFilter = document.getElementById('productCategoryFilter');
                 catFilter.innerHTML = '<option value="all">جميع التصنيفات</option>' +
@@ -2851,7 +3117,7 @@
 
         async function showProductForm() {
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 document.getElementById('productFormTitle').textContent = 'منتج جديد للبيع';
                 document.getElementById('productFormId').value = '';
                 document.getElementById('pfName').value = '';
@@ -2878,16 +3144,16 @@
                 document.getElementById('productFormModal').classList.add('active');
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في تحميل نموذج المنتج: ' + e.message, 'error');
+                showToast('خطأ في تحميل نموذج المنتج: ' + e.message, 'error');
             }
         }
 
         async function editProduct(id) {
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const p = await DBInstance.get('products', id);
                 if (!p) {
-                    DBInstance.showToast('المنتج غير موجود', 'error');
+                    showToast('المنتج غير موجود', 'error');
                     return;
                 }
                 document.getElementById('productFormTitle').textContent = 'تعديل المنتج';
@@ -2938,13 +3204,13 @@
                 document.getElementById('productFormModal').classList.add('active');
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في تحميل المنتج: ' + e.message, 'error');
+                showToast('خطأ في تحميل المنتج: ' + e.message, 'error');
             }
         }
 
         async function addRecipeItem() {
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const items = await DBInstance.getAll('inventoryItems') || [];
                 const opts = '<option value="" data-cost="0">اختر بنداً من المخزن...</option>' +
                     items.map(i => '<option value="' + i.id + '" data-cost="' + (i.unitCost || 0) + '">' + escapeHtml(i
@@ -2959,7 +3225,7 @@
                 container.appendChild(div);
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في إضافة مكون: ' + e.message, 'error');
+                showToast('خطأ في إضافة مكون: ' + e.message, 'error');
             }
         }
 
@@ -2994,7 +3260,7 @@
         async function saveProduct(e) {
             e.preventDefault();
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const id = document.getElementById('productFormId').value;
                 const p = {
                     name: document.getElementById('pfName').value.trim(),
@@ -3003,11 +3269,11 @@
                     status: document.getElementById('pfStatus').value
                 };
                 if (!p.name) {
-                    DBInstance.showToast('اسم المنتج مطلوب', 'warning');
+                    showToast('اسم المنتج مطلوب', 'warning');
                     return;
                 }
                 if (p.price <= 0) {
-                    DBInstance.showToast('سعر البيع يجب أن يكون أكبر من صفر', 'warning');
+                    showToast('سعر البيع يجب أن يكون أكبر من صفر', 'warning');
                     return;
                 }
 
@@ -3040,11 +3306,11 @@
                 }
 
                 closeProductForm();
-                DBInstance.showToast('تم حفظ المنتج', 'success');
+                showToast('تم حفظ المنتج', 'success');
                 await renderProducts();
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في حفظ المنتج: ' + e.message, 'error');
+                showToast('خطأ في حفظ المنتج: ' + e.message, 'error');
             }
         }
 
@@ -3055,27 +3321,27 @@
         async function deleteProduct(id) {
             if (!confirm('هل أنت متأكد من حذف هذا المنتج؟')) return;
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const recipes = await DBInstance.getAll('recipeItems') || [];
                 const toDelete = recipes.filter(r => r.productId === id);
                 for (let r of toDelete) {
                     await DBInstance.delete('recipeItems', r.id);
                 }
                 await DBInstance.delete('products', id);
-                DBInstance.showToast('تم حذف المنتج', 'success');
+                showToast('تم حذف المنتج', 'success');
                 await renderProducts();
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في حذف المنتج: ' + e.message, 'error');
+                showToast('خطأ في حذف المنتج: ' + e.message, 'error');
             }
         }
 
         // ================================================================
-        // ITEM CODES (with delete)
+        // ITEM CODES
         // ================================================================
         async function renderItemCodes() {
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const searchTerm = (document.getElementById('itemCodeSearch').value || '').toLowerCase().trim();
                 const categoryFilter = document.getElementById('itemCodeCategoryFilter').value;
 
@@ -3125,8 +3391,7 @@
         async function deleteInventoryItem(id) {
             if (!confirm('هل أنت متأكد من حذف هذا البند المخزني؟ سيتم فك الارتباط بالمنتجات المرتبطة.')) return;
             try {
-                await DBInstance.waitReady();
-                // Check if used in products
+                await ensureDBReady();
                 const recipes = await DBInstance.getAll('recipeItems') || [];
                 const used = recipes.filter(r => r.inventoryItemId === id);
                 if (used.length > 0) {
@@ -3137,18 +3402,18 @@
                     }
                 }
                 await DBInstance.delete('inventoryItems', id);
-                DBInstance.showToast('تم حذف البند', 'success');
+                showToast('تم حذف البند', 'success');
                 await renderItemCodes();
                 await renderInventory();
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في حذف البند: ' + e.message, 'error');
+                showToast('خطأ في حذف البند: ' + e.message, 'error');
             }
         }
 
         async function renderInventory() {
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const searchTerm = (document.getElementById('inventorySearch').value || '').toLowerCase().trim();
                 const categoryFilter = document.getElementById('inventoryCategoryFilter').value;
 
@@ -3173,8 +3438,11 @@
                     const qty = i.quantity || 0;
                     const minStock = i.minStock || 0;
                     const unitCost = i.unitCost || 0;
-                    const statusClass = qty > minStock ? 'available' : 'out';
-                    const statusText = qty > 0 ? 'متوفر' : 'نفد';
+                    let statusClass = 'available';
+                    let statusText = 'متوفر';
+                    if (qty <= 0) { statusClass = 'out';
+                        statusText = 'نفد'; } else if (qty <= minStock) { statusClass = 'low';
+                        statusText = 'منخفض'; }
                     return '<tr>' +
                         '<td><strong>' + escapeHtml(i.name) + '</strong></td>' +
                         '<td>' + escapeHtml(catMap[i.category] || '-') + '</td>' +
@@ -3184,7 +3452,7 @@
                         '<td>' + unitCost.toFixed(2) + '</td>' +
                         '<td>' + (qty * unitCost).toFixed(2) + '</td>' +
                         '<td><span class="status-badge ' + statusClass + '">' + statusText + '</span></td>' +
-                        '<td><button class="btn btn-danger btn-sm" onclick="adjustStock(' + i.id +
+                        '<td><button class="btn btn-warning btn-sm" onclick="adjustStock(' + i.id +
                         ')">تسوية</button></td>' +
                         '</tr>';
                 }).join('');
@@ -3197,7 +3465,7 @@
 
         async function showInventoryItemForm() {
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 document.getElementById('inventoryFormTitle').textContent = 'تكويد صنف جديد';
                 document.getElementById('ifId').value = '';
                 ['ifName', 'ifSku', 'ifQuantity', 'ifUnitCost', 'ifMinStock', 'ifMaxStock', 'ifSupplier', 'ifNotes']
@@ -3212,16 +3480,16 @@
                 document.getElementById('inventoryFormModal').classList.add('active');
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في تحميل النموذج: ' + e.message, 'error');
+                showToast('خطأ في تحميل النموذج: ' + e.message, 'error');
             }
         }
 
         async function editInventoryItem(id) {
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const i = await DBInstance.get('inventoryItems', id);
                 if (!i) {
-                    DBInstance.showToast('الصنف غير موجود', 'error');
+                    showToast('الصنف غير موجود', 'error');
                     return;
                 }
                 document.getElementById('ifId').value = i.id;
@@ -3242,18 +3510,18 @@
                 document.getElementById('inventoryFormModal').classList.add('active');
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في تحميل الصنف: ' + e.message, 'error');
+                showToast('خطأ في تحميل الصنف: ' + e.message, 'error');
             }
         }
 
         async function saveInventoryItem(e) {
             e.preventDefault();
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const id = document.getElementById('ifId').value;
                 const name = document.getElementById('ifName').value.trim();
                 if (!name) {
-                    DBInstance.showToast('اسم الصنف مطلوب', 'warning');
+                    showToast('اسم الصنف مطلوب', 'warning');
                     return;
                 }
                 const item = {
@@ -3275,13 +3543,13 @@
                     await DBInstance.add('inventoryItems', item);
                 }
                 closeInventoryForm();
-                DBInstance.showToast('تم حفظ الصنف', 'success');
+                showToast('تم حفظ الصنف', 'success');
                 await renderItemCodes();
                 await renderInventory();
                 await updateCategoryFilters();
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في حفظ الصنف: ' + e.message, 'error');
+                showToast('خطأ في حفظ الصنف: ' + e.message, 'error');
             }
         }
 
@@ -3291,10 +3559,10 @@
 
         async function adjustStock(id) {
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const i = await DBInstance.get('inventoryItems', id);
                 if (!i) {
-                    DBInstance.showToast('الصنف غير موجود', 'error');
+                    showToast('الصنف غير موجود', 'error');
                     return;
                 }
                 const currentQty = i.quantity || 0;
@@ -3303,7 +3571,7 @@
                 if (qtyStr === null) return;
                 const qty = parseFloat(qtyStr);
                 if (isNaN(qty) || qty < 0) {
-                    DBInstance.showToast('القيمة غير صالحة (يجب أن تكون رقماً موجباً)', 'warning');
+                    showToast('القيمة غير صالحة (يجب أن تكون رقماً موجباً)', 'warning');
                     return;
                 }
                 const oldQty = i.quantity;
@@ -3320,51 +3588,26 @@
                     note: 'تسوية جرد يدوية'
                 });
 
-                DBInstance.showToast('تمت التسوية', 'success');
+                showToast('تمت التسوية', 'success');
                 await renderInventory();
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في تسوية الجرد: ' + e.message, 'error');
-            }
-        }
-
-        async function updateCategoryFilters() {
-            try {
-                await DBInstance.waitReady();
-                const cats = await DBInstance.getAll('categories') || [];
-                const catOptions = '<option value="all">جميع التصنيفات</option>' +
-                    cats.map(c => '<option value="' + c.id + '">' + escapeHtml(c.name) + '</option>').join('');
-
-                const filterIds = ['itemCodeCategoryFilter', 'inventoryCategoryFilter', 'productCategoryFilter'];
-                for (let id of filterIds) {
-                    const el = document.getElementById(id);
-                    if (el) {
-                        const current = el.value;
-                        el.innerHTML = catOptions;
-                        if (current) el.value = current;
-                    }
-                }
-            } catch (e) {
-                console.error(e);
+                showToast('خطأ في تسوية الجرد: ' + e.message, 'error');
             }
         }
 
         // ================================================================
-        // PURCHASES (with edit & delete)
+        // PURCHASES
         // ================================================================
         async function renderPurchases() {
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const dateFrom = document.getElementById('purchaseDateFrom').value;
                 const dateTo = document.getElementById('purchaseDateTo').value;
 
                 let purs = await DBInstance.getAll('purchases') || [];
-                if (dateFrom) {
-                    purs = purs.filter(p => p.date >= dateFrom);
-                }
-                if (dateTo) {
-                    purs = purs.filter(p => p.date <= dateTo);
-                }
+                if (dateFrom) purs = purs.filter(p => p.date >= dateFrom);
+                if (dateTo) purs = purs.filter(p => p.date <= dateTo);
                 purs.sort((a, b) => (b.id || 0) - (a.id || 0));
 
                 const tbody = document.getElementById('purchasesTableBody');
@@ -3398,7 +3641,7 @@
 
         async function showPurchaseForm() {
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 document.getElementById('purchaseFormTitle').textContent = 'فاتورة شراء (زيادة المخزون)';
                 document.getElementById('purchaseEditId').value = '';
                 document.getElementById('purchaseQty').value = '';
@@ -3415,16 +3658,16 @@
                 document.getElementById('purchaseFormModal').classList.add('active');
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في تحميل نموذج الشراء: ' + e.message, 'error');
+                showToast('خطأ في تحميل نموذج الشراء: ' + e.message, 'error');
             }
         }
 
         async function editPurchase(id) {
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const p = await DBInstance.get('purchases', id);
                 if (!p) {
-                    DBInstance.showToast('الفاتورة غير موجودة', 'error');
+                    showToast('الفاتورة غير موجودة', 'error');
                     return;
                 }
                 document.getElementById('purchaseFormTitle').textContent = 'تعديل فاتورة شراء';
@@ -3444,26 +3687,23 @@
                 document.getElementById('purchaseFormModal').classList.add('active');
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في تحميل الفاتورة: ' + e.message, 'error');
+                showToast('خطأ في تحميل الفاتورة: ' + e.message, 'error');
             }
         }
 
         async function deletePurchase(id) {
             if (!confirm('هل أنت متأكد من حذف فاتورة الشراء هذه؟ سيتم إلغاء تأثيرها على المخزون.')) return;
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const p = await DBInstance.get('purchases', id);
                 if (!p) {
-                    DBInstance.showToast('الفاتورة غير موجودة', 'error');
+                    showToast('الفاتورة غير موجودة', 'error');
                     return;
                 }
-                // Reverse the effect on inventory
                 const item = await DBInstance.get('inventoryItems', p.itemId);
                 if (item) {
                     const oldQty = item.quantity || 0;
                     const newQty = Math.max(0, oldQty - (p.quantity || 0));
-                    // Recalculate average cost: remove this purchase's effect
-                    // Simple approach: just reduce quantity, keep average cost as is (simplified)
                     item.quantity = newQty;
                     await DBInstance.put('inventoryItems', item);
 
@@ -3479,12 +3719,12 @@
                     });
                 }
                 await DBInstance.delete('purchases', id);
-                DBInstance.showToast('تم حذف فاتورة الشراء', 'success');
+                showToast('تم حذف فاتورة الشراء', 'success');
                 await renderPurchases();
                 await renderInventory();
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في حذف الفاتورة: ' + e.message, 'error');
+                showToast('خطأ في حذف الفاتورة: ' + e.message, 'error');
             }
         }
 
@@ -3495,46 +3735,39 @@
         async function savePurchase(e) {
             e.preventDefault();
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const editId = document.getElementById('purchaseEditId').value;
                 const itemId = parseInt(document.getElementById('purchaseItem').value);
                 const qty = parseFloat(document.getElementById('purchaseQty').value);
                 const price = parseFloat(document.getElementById('purchasePrice').value);
 
                 if (!itemId) {
-                    DBInstance.showToast('اختر صنفاً', 'warning');
+                    showToast('اختر صنفاً', 'warning');
                     return;
                 }
                 if (!qty || qty <= 0) {
-                    DBInstance.showToast('الكمية يجب أن تكون أكبر من صفر', 'warning');
+                    showToast('الكمية يجب أن تكون أكبر من صفر', 'warning');
                     return;
                 }
                 if (!price || price <= 0) {
-                    DBInstance.showToast('السعر يجب أن يكون أكبر من صفر', 'warning');
+                    showToast('السعر يجب أن يكون أكبر من صفر', 'warning');
                     return;
                 }
 
                 const item = await DBInstance.get('inventoryItems', itemId);
                 if (!item) {
-                    DBInstance.showToast('الصنف غير موجود', 'error');
+                    showToast('الصنف غير موجود', 'error');
                     return;
                 }
 
                 if (editId) {
-                    // Edit mode: reverse old purchase, apply new
                     const oldPur = await DBInstance.get('purchases', parseInt(editId));
                     if (!oldPur) {
-                        DBInstance.showToast('الفاتورة الأصلية غير موجودة', 'error');
+                        showToast('الفاتورة الأصلية غير موجودة', 'error');
                         return;
                     }
-                    // Reverse old
                     const oldQty = oldPur.quantity || 0;
-                    const oldPrice = oldPur.price || 0;
-                    // Remove old effect
                     item.quantity = Math.max(0, (item.quantity || 0) - oldQty);
-                    // Recalculate average cost (simplified: just remove the old purchase value)
-                    // We'll just keep the average as is
-                    // Apply new
                     const newQty = (item.quantity || 0) + qty;
                     const newTotalCost = (item.quantity * (item.unitCost || 0)) + (qty * price);
                     const newAvgCost = newQty > 0 ? newTotalCost / newQty : 0;
@@ -3542,7 +3775,6 @@
                     item.unitCost = newAvgCost;
                     await DBInstance.put('inventoryItems', item);
 
-                    // Update purchase record
                     oldPur.itemId = itemId;
                     oldPur.itemName = item.name;
                     oldPur.quantity = qty;
@@ -3555,9 +3787,8 @@
                     oldPur.invoice = document.getElementById('purchaseInvoice').value.trim() || '';
                     oldPur.notes = document.getElementById('purchaseNotes').value.trim() || '';
                     await DBInstance.put('purchases', oldPur);
-                    DBInstance.showToast('تم تحديث فاتورة الشراء', 'success');
+                    showToast('تم تحديث فاتورة الشراء', 'success');
                 } else {
-                    // New purchase
                     const oldQty = item.quantity || 0;
                     const oldCost = item.unitCost || 0;
                     const newTotalCost = (oldQty * oldCost) + (qty * price);
@@ -3592,7 +3823,7 @@
                         date: new Date().toISOString().split('T')[0],
                         note: 'فاتورة شراء'
                     });
-                    DBInstance.showToast('تم الشراء وتحديث الرصيد والمتوسط', 'success');
+                    showToast('تم الشراء وتحديث الرصيد والمتوسط', 'success');
                 }
 
                 closePurchaseForm();
@@ -3600,7 +3831,7 @@
                 await renderInventory();
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في حفظ الشراء: ' + e.message, 'error');
+                showToast('خطأ في حفظ الشراء: ' + e.message, 'error');
             }
         }
 
@@ -3609,7 +3840,7 @@
         // ================================================================
         async function renderPOS() {
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const cats = await DBInstance.getAll('categories') || [];
                 document.getElementById('posCategories').innerHTML =
                     '<button class="cat-btn active" data-cat="all" onclick="filterPosProducts(\'all\')">الكل</button>' +
@@ -3619,7 +3850,7 @@
                 updateCartDisplay();
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في تحميل نقطة البيع: ' + e.message, 'error');
+                showToast('خطأ في تحميل نقطة البيع: ' + e.message, 'error');
             }
         }
 
@@ -3634,7 +3865,7 @@
 
         async function loadPosProducts() {
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 let prods = await DBInstance.getAll('products') || [];
                 prods = prods.filter(p => p.status === 'active' && (AppState.selectedCategory === 'all' || p
                 .category == AppState.selectedCategory));
@@ -3659,7 +3890,7 @@
 
         async function addToCart(id) {
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const p = await DBInstance.get('products', id);
                 if (!p) return;
                 const ex = AppState.cart.find(c => c.productId === id);
@@ -3672,7 +3903,7 @@
                 updateCartDisplay();
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في إضافة المنتج: ' + e.message, 'error');
+                showToast('خطأ في إضافة المنتج: ' + e.message, 'error');
             }
         }
 
@@ -3708,8 +3939,9 @@
             }
 
             const sub = AppState.cart.reduce((s, i) => s + ((i.price || 0) * (i.quantity || 0)), 0);
-            const disc = sub * ((AppState.cartDiscount || 0) / 100);
-            const taxableAmount = Math.max(0, sub - disc);
+            const discPct = Math.min(Math.max(AppState.cartDiscount || 0, 0), 100);
+            const discAmt = sub * (discPct / 100);
+            const taxableAmount = Math.max(0, sub - discAmt);
 
             const taxEnabled = AppState.settings && AppState.settings.taxEnabled;
             const taxPercent = taxEnabled ? (AppState.settings.taxPercent || 0) : 0;
@@ -3717,8 +3949,8 @@
             const grandTotal = taxableAmount + taxAmount;
 
             document.getElementById('posSubtotal').textContent = sub.toFixed(2);
-            document.getElementById('posDiscountPercent').textContent = AppState.cartDiscount || 0;
-            document.getElementById('posDiscountAmount').textContent = disc.toFixed(2);
+            document.getElementById('posDiscountPercent').textContent = discPct;
+            document.getElementById('posDiscountAmount').textContent = discAmt.toFixed(2);
             document.getElementById('posTaxPercent').textContent = taxPercent;
             document.getElementById('posTaxAmount').textContent = taxAmount.toFixed(2);
             document.getElementById('posGrandTotal').textContent = grandTotal.toFixed(2);
@@ -3742,16 +3974,21 @@
         }
 
         function applyDiscount() {
-            const d = prompt('نسبة الخصم %', AppState.cartDiscount || 0);
-            if (d !== null && d.trim() !== '' && !isNaN(d)) {
-                AppState.cartDiscount = Math.max(0, parseFloat(d));
+            const d = prompt('نسبة الخصم % (0-100)', AppState.cartDiscount || 0);
+            if (d !== null && d.trim() !== '') {
+                const val = parseFloat(d);
+                if (!isNaN(val) && val >= 0 && val <= 100) {
+                    AppState.cartDiscount = val;
+                } else {
+                    showToast('نسبة الخصم يجب أن تكون بين 0 و 100', 'warning');
+                }
                 updateCartDisplay();
             }
         }
 
         function showPaymentModal() {
             if (!AppState.cart || AppState.cart.length === 0) {
-                DBInstance.showToast('السلة فارغة', 'warning');
+                showToast('السلة فارغة', 'warning');
                 return;
             }
             document.getElementById('paymentAmount').value = document.getElementById('posGrandTotal').textContent;
@@ -3780,9 +4017,12 @@
             document.getElementById('paymentChange').value = Math.max(0, paid - grand).toFixed(2);
         }
 
+        // ================================================================
+        // COMPLETE PAYMENT - FINAL FIX
+        // ================================================================
         async function completePayment() {
             if (AppState.isProcessingPayment) {
-                DBInstance.showToast('جاري معالجة الطلب...', 'info');
+                showToast('جاري معالجة الطلب...', 'info');
                 return;
             }
 
@@ -3790,12 +4030,13 @@
             const paid = parseFloat(document.getElementById('paymentAmount').value) || 0;
 
             if (paid < grand) {
-                DBInstance.showToast('المبلغ المدفوع أقل من الفاتورة', 'error');
+                showToast('المبلغ المدفوع (' + paid.toFixed(2) + ') أقل من إجمالي الفاتورة (' + grand.toFixed(2) + ')',
+                    'error');
                 return;
             }
 
             if (!AppState.cart || AppState.cart.length === 0) {
-                DBInstance.showToast('السلة فارغة', 'warning');
+                showToast('السلة فارغة', 'warning');
                 return;
             }
 
@@ -3803,12 +4044,13 @@
             const paymentModal = document.getElementById('paymentModal');
 
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
 
                 const recipes = await DBInstance.getAll('recipeItems') || [];
                 const invItems = await DBInstance.getAll('inventoryItems') || [];
-                const required = {};
 
+                // Calculate required inventory
+                const required = {};
                 for (const c of AppState.cart) {
                     const myR = recipes.filter(r => r.productId === c.productId);
                     myR.forEach(r => {
@@ -3817,99 +4059,216 @@
                     });
                 }
 
+                // Validate inventory
                 for (const idStr of Object.keys(required)) {
                     const id = parseInt(idStr);
                     const inv = invItems.find(i => i.id === id);
                     if (!inv) {
-                        DBInstance.showToast('المنتج مرتبط بصنف مخزني غير موجود', 'error');
+                        showToast('المنتج مرتبط بصنف مخزني غير موجود', 'error');
                         AppState.isProcessingPayment = false;
                         return;
                     }
                     if ((inv.quantity || 0) < required[idStr]) {
-                        DBInstance.showToast('مخزون الصنف (' + escapeHtml(inv.name) + ') غير كافِ. المطلوب: ' + required[
+                        showToast('مخزون الصنف (' + escapeHtml(inv.name) + ') غير كافِ. المطلوب: ' + required[
                             idStr] + '، المتوفر: ' + inv.quantity, 'error');
                         AppState.isProcessingPayment = false;
                         return;
                     }
                 }
 
+                // Calculate costs
                 let totalCost = 0;
                 for (const idStr of Object.keys(required)) {
                     const id = parseInt(idStr);
                     const inv = invItems.find(i => i.id === id);
                     if (inv) {
-                        const qtyToDeduct = required[idStr];
-                        inv.quantity = (inv.quantity || 0) - qtyToDeduct;
-                        totalCost += qtyToDeduct * (inv.unitCost || 0);
-                        await DBInstance.put('inventoryItems', inv);
-
-                        await DBInstance.add('inventoryTransactions', {
-                            itemId: inv.id,
-                            itemName: inv.name,
-                            type: 'sale',
-                            quantity: qtyToDeduct,
-                            unitCost: inv.unitCost || 0,
-                            totalCost: qtyToDeduct * (inv.unitCost || 0),
-                            date: new Date().toISOString().split('T')[0],
-                            note: 'فاتورة بيع #' + document.getElementById('posOrderNumber').textContent
-                        });
+                        totalCost += required[idStr] * (inv.unitCost || 0);
                     }
                 }
 
                 const now = new Date();
+                const orderNumberStr = 'ORD-' + String(AppState.orderNumber).padStart(6, '0');
+
+                const subtotal = parseFloat(document.getElementById('posSubtotal').textContent) || 0;
+                const discountPct = AppState.cartDiscount || 0;
+                const taxAmt = parseFloat(document.getElementById('posTaxAmount').textContent) || 0;
+
+                // ============================================================
+                // CRITICAL FIX: Create completely clean objects with only primitive values
+                // No nested objects, no arrays, no functions, no references
+                // ============================================================
                 const order = {
-                    orderNumber: document.getElementById('posOrderNumber').textContent,
-                    date: now.toISOString().split('T')[0],
-                    time: now.toTimeString().split(' ')[0],
-                    subtotal: parseFloat(document.getElementById('posSubtotal').textContent) || 0,
-                    discountPercent: AppState.cartDiscount || 0,
-                    taxAmount: parseFloat(document.getElementById('posTaxAmount').textContent) || 0,
-                    grandTotal: grand,
-                    totalCost: totalCost,
-                    profit: grand - totalCost,
-                    paymentMethod: AppState.selectedPayment || 'cash',
-                    status: 'paid',
-                    items: JSON.parse(JSON.stringify(AppState.cart))
+                    orderNumber: String(orderNumberStr),
+                    date: String(now.toISOString().split('T')[0]),
+                    time: String(now.toTimeString().split(' ')[0]),
+                    subtotal: Number(parseFloat(subtotal.toFixed(2))),
+                    discountPercent: Number(parseFloat(discountPct.toFixed(2))),
+                    taxAmount: Number(parseFloat(taxAmt.toFixed(2))),
+                    grandTotal: Number(parseFloat(grand.toFixed(2))),
+                    totalCost: Number(parseFloat(totalCost.toFixed(2))),
+                    profit: Number(parseFloat((grand - totalCost).toFixed(2))),
+                    paymentMethod: String(AppState.selectedPayment || 'cash'),
+                    status: 'paid'
                 };
 
-                await DBInstance.add('orders', order);
+                // Clean cart items - each item is a plain object with primitive values
+                const cleanCartItems = AppState.cart.map(item => ({
+                    productId: Number(item.productId),
+                    name: String(item.name || 'منتج'),
+                    price: Number(parseFloat((item.price || 0).toFixed(2))),
+                    quantity: Number(parseFloat((item.quantity || 1).toFixed(3)))
+                }));
+
+                // Use a try-catch for the transaction
+                if (DBInstance.engine && DBInstance.engine.transaction) {
+                    try {
+                        await DBInstance.engine.transaction(
+                            ['inventoryItems', 'inventoryTransactions', 'orders', 'orderItems'],
+                            'readwrite',
+                            async (tx) => {
+                                // Deduct inventory
+                                for (const idStr of Object.keys(required)) {
+                                    const id = parseInt(idStr);
+                                    const inv = await tx.objectStore('inventoryItems').get(id);
+                                    if (!inv) throw new Error('Inventory item not found: ' + id);
+                                    const qtyToDeduct = required[idStr];
+                                    inv.quantity = Number(parseFloat((inv.quantity - qtyToDeduct).toFixed(3)));
+                                    await tx.objectStore('inventoryItems').put(inv);
+
+                                    await tx.objectStore('inventoryTransactions').add({
+                                        itemId: Number(inv.id),
+                                        itemName: String(inv.name),
+                                        type: 'sale',
+                                        quantity: Number(parseFloat(qtyToDeduct.toFixed(3))),
+                                        unitCost: Number(parseFloat((inv.unitCost || 0).toFixed(2))),
+                                        totalCost: Number(parseFloat((qtyToDeduct * (inv.unitCost || 0))
+                                            .toFixed(2))),
+                                        date: String(new Date().toISOString().split('T')[0]),
+                                        note: 'فاتورة بيع #' + orderNumberStr
+                                    });
+                                }
+
+                                // Create order - use JSON stringify/parse to ensure clean object
+                                const orderStr = JSON.stringify(order);
+                                const orderClean = JSON.parse(orderStr);
+                                const orderId = await tx.objectStore('orders').add(orderClean);
+
+                                // Create order items
+                                for (const item of cleanCartItems) {
+                                    const itemStr = JSON.stringify({
+                                        orderId: Number(orderId),
+                                        productId: Number(item.productId),
+                                        name: String(item.name),
+                                        quantity: Number(parseFloat(item.quantity.toFixed(3))),
+                                        price: Number(parseFloat(item.price.toFixed(2))),
+                                        total: Number(parseFloat((item.price * item.quantity).toFixed(2)))
+                                    });
+                                    const itemClean = JSON.parse(itemStr);
+                                    await tx.objectStore('orderItems').add(itemClean);
+                                }
+                            }
+                        );
+                    } catch (txError) {
+                        console.error('Transaction error:', txError);
+                        throw txError;
+                    }
+                } else {
+                    // LocalStorage fallback
+                    for (const idStr of Object.keys(required)) {
+                        const id = parseInt(idStr);
+                        const inv = await DBInstance.get('inventoryItems', id);
+                        if (!inv) throw new Error('Inventory item not found: ' + id);
+                        const qtyToDeduct = required[idStr];
+                        inv.quantity = Number(parseFloat((inv.quantity - qtyToDeduct).toFixed(3)));
+                        await DBInstance.put('inventoryItems', inv);
+                        await DBInstance.add('inventoryTransactions', {
+                            itemId: Number(inv.id),
+                            itemName: String(inv.name),
+                            type: 'sale',
+                            quantity: Number(parseFloat(qtyToDeduct.toFixed(3))),
+                            unitCost: Number(parseFloat((inv.unitCost || 0).toFixed(2))),
+                            totalCost: Number(parseFloat((qtyToDeduct * (inv.unitCost || 0)).toFixed(2))),
+                            date: String(new Date().toISOString().split('T')[0]),
+                            note: 'فاتورة بيع #' + orderNumberStr
+                        });
+                    }
+                    const orderStr = JSON.stringify(order);
+                    const orderClean = JSON.parse(orderStr);
+                    const orderId = await DBInstance.add('orders', orderClean);
+                    for (const item of cleanCartItems) {
+                        const itemStr = JSON.stringify({
+                            orderId: Number(orderId),
+                            productId: Number(item.productId),
+                            name: String(item.name),
+                            quantity: Number(parseFloat(item.quantity.toFixed(3))),
+                            price: Number(parseFloat(item.price.toFixed(2))),
+                            total: Number(parseFloat((item.price * item.quantity).toFixed(2)))
+                        });
+                        const itemClean = JSON.parse(itemStr);
+                        await DBInstance.add('orderItems', itemClean);
+                    }
+                }
+
+                // Prepare order with items for receipt
+                const orderWithItems = {
+                    ...order,
+                    items: cleanCartItems
+                };
 
                 AppState.orderNumber++;
-
                 AppState.cart = [];
                 AppState.cartDiscount = 0;
                 updateCartDisplay();
                 paymentModal.classList.remove('active');
                 AppState.isProcessingPayment = false;
 
-                syncChannel.postMessage({ type: 'NEW_ORDER', data: order });
-
-                DBInstance.showToast('تم الدفع بنجاح', 'success');
-                printReceipt(order);
-
-                if (document.getElementById('page-dashboard').classList.contains('active')) {
-                    await renderDashboard();
-                }
-                if (document.getElementById('page-inventory').classList.contains('active')) {
-                    await renderInventory();
-                }
-                if (document.getElementById('page-orders').classList.contains('active')) {
-                    await renderOrders();
-                }
+                broadcastNewOrder(orderWithItems);
+                showToast('تم الدفع بنجاح', 'success');
+                printReceipt(orderWithItems);
+                await refreshCurrentPage();
 
             } catch (e) {
-                console.error(e);
+                console.error('Payment error:', e);
                 AppState.isProcessingPayment = false;
-                DBInstance.showToast('خطأ في إتمام الطلب: ' + e.message, 'error');
+                showToast('خطأ في إتمام الطلب: ' + e.message, 'error');
+                // Attempt rollback for localStorage
+                if (!DBInstance.engine || !DBInstance.engine.transaction) {
+                    try {
+                        const orders = await DBInstance.getAll('orders');
+                        const lastOrder = orders && orders.length > 0 ? orders[orders.length - 1] : null;
+                        if (lastOrder && lastOrder.orderNumber === orderNumberStr) {
+                            const orderItems = await DBInstance.getAll('orderItems') || [];
+                            const items = orderItems.filter(oi => oi.orderId === lastOrder.id);
+                            for (const item of items) {
+                                const recipes2 = await DBInstance.getAll('recipeItems') || [];
+                                const myRecipes = recipes2.filter(r => r.productId === item.productId);
+                                for (const r of myRecipes) {
+                                    const inv = await DBInstance.get('inventoryItems', r.inventoryItemId);
+                                    if (inv) {
+                                        inv.quantity = (inv.quantity || 0) + (r.quantity || 0) * (item
+                                        .quantity || 0);
+                                        await DBInstance.put('inventoryItems', inv);
+                                    }
+                                }
+                            }
+                            await DBInstance.delete('orders', lastOrder.id);
+                            for (const oi of orderItems) {
+                                if (oi.orderId === lastOrder.id) {
+                                    await DBInstance.delete('orderItems', oi.id);
+                                }
+                            }
+                        }
+                    } catch (_) { /* ignore rollback errors */ }
+                }
             }
         }
 
         // ================================================================
-        // ORDERS (with view invoice)
+        // ORDERS
         // ================================================================
         async function renderOrders() {
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const searchTerm = (document.getElementById('orderSearch').value || '').toLowerCase().trim();
                 const dateFrom = document.getElementById('orderDateFrom').value;
                 const dateTo = document.getElementById('orderDateTo').value;
@@ -3950,7 +4309,7 @@
                     '<button class="btn btn-primary btn-sm" onclick="reprintOrder(' + o.id +
                     ')">🖨️ طباعة</button> ' +
                     '<button class="btn btn-info btn-sm" onclick="viewInvoice(' + o.id +
-                    ')" style="background:#17a2b8;color:white;">📄 عرض</button>' +
+                    ')">📄 عرض</button>' +
                     '</td>' +
                     '</tr>'
                 ).join('');
@@ -3963,28 +4322,35 @@
 
         async function reprintOrder(id) {
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const o = await DBInstance.get('orders', id);
-                if (o) printReceipt(o);
-                else DBInstance.showToast('الفاتورة غير موجودة', 'error');
+                if (o) {
+                    const orderItems = await DBInstance.getAll('orderItems') || [];
+                    const items = orderItems.filter(oi => oi.orderId === o.id);
+                    const orderWithItems = { ...o, items: items };
+                    printReceipt(orderWithItems);
+                } else {
+                    showToast('الفاتورة غير موجودة', 'error');
+                }
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في طباعة الفاتورة: ' + e.message, 'error');
+                showToast('خطأ في طباعة الفاتورة: ' + e.message, 'error');
             }
         }
 
-        // ----- VIEW INVOICE -----
         async function viewInvoice(id) {
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const o = await DBInstance.get('orders', id);
                 if (!o) {
-                    DBInstance.showToast('الفاتورة غير موجودة', 'error');
+                    showToast('الفاتورة غير موجودة', 'error');
                     return;
                 }
 
+                const orderItems = await DBInstance.getAll('orderItems') || [];
+                const items = orderItems.filter(oi => oi.orderId === o.id);
+
                 const container = document.getElementById('invoiceViewContent');
-                const items = o.items || [];
                 let itemsHtml = items.map(i =>
                     '<tr><td>' + escapeHtml(i.name || '') + '</td><td>' + (i.quantity || 0) + '</td><td>' + (i
                         .price || 0).toFixed(2) + '</td><td>' + ((i.price || 0) * (i.quantity || 0)).toFixed(2) +
@@ -4022,11 +4388,10 @@
                 `;
 
                 document.getElementById('viewInvoiceModal').classList.add('active');
-                // Store order id for printing
                 document.getElementById('viewInvoiceModal').dataset.orderId = o.id;
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في عرض الفاتورة: ' + e.message, 'error');
+                showToast('خطأ في عرض الفاتورة: ' + e.message, 'error');
             }
         }
 
@@ -4057,10 +4422,13 @@
                 win.document.write(html);
                 win.document.close();
             } else {
-                DBInstance.showToast('الرجاء السماح للنوافذ المنبثقة', 'warning');
+                showToast('الرجاء السماح للنوافذ المنبثقة', 'warning');
             }
         }
 
+        // ================================================================
+        // PRINT RECEIPT
+        // ================================================================
         function printReceipt(order) {
             try {
                 const s = AppState.settings || {};
@@ -4130,17 +4498,11 @@
                     win.document.write(html);
                     win.document.close();
                 } else {
-                    const printWin = window.open('', '_blank', 'width=400,height=600');
-                    if (printWin) {
-                        printWin.document.write(html);
-                        printWin.document.close();
-                    } else {
-                        DBInstance.showToast('الرجاء السماح للنوافذ المنبثقة', 'warning');
-                    }
+                    showToast('الرجاء السماح للنوافذ المنبثقة', 'warning');
                 }
             } catch (e) {
                 console.error(e);
-                DBInstance.showToast('خطأ في الطباعة: ' + e.message, 'error');
+                showToast('خطأ في الطباعة: ' + e.message, 'error');
             }
         }
 
@@ -4149,7 +4511,7 @@
         // ================================================================
         async function generateReport(t) {
             try {
-                await DBInstance.waitReady();
+                await ensureDBReady();
                 const p = document.getElementById('reportContent');
                 document.getElementById('reportTitle').textContent =
                     t === 'sales' ? 'تقرير المبيعات' :
@@ -4187,13 +4549,11 @@
                     }
                     html += '</table>';
                 } else if (t === 'products') {
+                    const orderItems = await DBInstance.getAll('orderItems') || [];
                     const pSales = {};
-                    paidOrders.forEach(o => {
-                        const items = o.items || [];
-                        items.forEach(i => {
-                            pSales[i.name] = (pSales[i.name] || 0) + (i.quantity || 0);
-                        });
-                    });
+                    for (const oi of orderItems) {
+                        pSales[oi.name] = (pSales[oi.name] || 0) + (oi.quantity || 0);
+                    }
                     const sorted = Object.entries(pSales).sort((a, b) => b[1] - a[1]);
                     html = '<table style="width:100%;">' +
                         '<tr><th style="text-align:right;">المنتج</th><th style="text-align:right;">الكمية المباعة</th></tr>';
@@ -4209,82 +4569,6 @@
                 console.error(e);
                 document.getElementById('reportContent').innerHTML = '<p style="color:red;">خطأ في تحميل التقرير: ' +
                     escapeHtml(e.message) + '</p>';
-            }
-        }
-
-        // ================================================================
-        // DEMO DATA & CLEAR ALL
-        // ================================================================
-        async function loadDemoData() {
-            if (!confirm('هل أنت متأكد من تحميل بيانات تجريبية (ملابس وعطور)؟')) return;
-            await DBInstance.loadDemoData();
-            await renderDashboard();
-            await renderProducts();
-            await renderItemCodes();
-            await renderInventory();
-            await renderCategories();
-            await updateCategoryFilters();
-            if (document.getElementById('page-pos').classList.contains('active')) await renderPOS();
-            DBInstance.showToast('تم تحديث الصفحات بالبيانات التجريبية', 'success');
-        }
-
-        async function clearAllData() {
-            if (!confirm('تحذير: سيتم حذف جميع الفواتير والمخزون نهائياً. تأكيد؟')) return;
-            if (!confirm('هل أنت متأكد تماماً؟ هذا الإجراء لا يمكن التراجع عنه.')) return;
-
-            try {
-                await DBInstance.waitReady();
-
-                if (DBInstance.engine instanceof LocalStorageEngine) {
-                    DBInstance.engine.resetAll();
-                } else {
-                    const storeNames = ['users', 'settings', 'categories', 'inventoryItems', 'purchases',
-                        'inventoryTransactions', 'products', 'recipeItems', 'orders', 'orderItems', 'auditLogs'
-                    ];
-                    for (let name of storeNames) {
-                        const items = await DBInstance.getAll(name) || [];
-                        for (let item of items) {
-                            await DBInstance.delete(name, item.id);
-                        }
-                    }
-                }
-
-                await DBInstance.ensureDefaultData();
-
-                const set = await DBInstance.get('settings', 1);
-                if (set) AppState.settings = set;
-
-                const orders = await DBInstance.getAll('orders') || [];
-                if (orders && orders.length > 0) {
-                    let maxNum = 0;
-                    for (let o of orders) {
-                        const numStr = String(o.orderNumber || '').replace('ORD-', '');
-                        const num = parseInt(numStr, 10);
-                        if (!isNaN(num) && num > maxNum) maxNum = num;
-                    }
-                    if (maxNum > 0) AppState.orderNumber = maxNum + 1;
-                } else {
-                    AppState.orderNumber = 1;
-                }
-
-                AppState.cart = [];
-                AppState.cartDiscount = 0;
-                updateCartDisplay();
-
-                await renderDashboard();
-                await renderProducts();
-                await renderItemCodes();
-                await renderInventory();
-                await renderPurchases();
-                await renderOrders();
-                await renderCategories();
-                await updateCategoryFilters();
-                if (document.getElementById('page-pos').classList.contains('active')) await renderPOS();
-
-                DBInstance.showToast('تم مسح جميع البيانات وإعادة التهيئة', 'success');
-            } catch (e) {
-                console.error(e);
-                DBInstance.showToast('فشل مسح البيانات: ' + e.message, 'error');
             }
         }
 
